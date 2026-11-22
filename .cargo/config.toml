@@ -1,0 +1,10 @@
+# 项目级镜像（全局 ~/.cargo/config.toml 已配，这里兜底防止换机后失效）
+[source.crates-io]
+replace-with = "rsproxy-sparse"
+
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+
+[net]
+git-fetch-with-cli = true
+retry = 5

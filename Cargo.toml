@@ -1,0 +1,49 @@
+[package]
+name = "rdp-launcher"
+version = "0.4.4"
+edition = "2021"
+rust-version = "1.81"
+description = "极速轻量级 RDP 远程桌面悬浮启动器"
+build = "build.rs"
+
+[dependencies]
+# 渲染后端回到 glow（需求原文指定的就是它）。
+# 为什么不是 wgpu：本机是 Intel Haswell 核显，wgpu 的 DX12 后端在源码里
+# 明确拉黑了整个 Haswell 家族（见 wgpu-hal `should_keep_adapter`），
+# 而且 RDP 会话下 DXGI 枚举返回 0 个适配器，连 WARP 都拿不到。
+eframe = { version = "0.31", default-features = false, features = ["glow", "default_fonts"] }
+egui = "0.31"
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+aes-gcm = "0.10"
+base64 = "0.22"
+rand = "0.8"
+sha2 = "0.10"
+
+windows = { version = "0.58", features = [
+    "Win32_Security_Credentials",
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_WindowsProgramming",
+    "Win32_System_Registry",
+    "Win32_System_Com",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+tray-icon = "0.24.2"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+
+# 调试构建也做一点优化，否则 wgpu 在 2 核机器上跑起来像幻灯片
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
