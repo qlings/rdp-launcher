@@ -255,7 +255,8 @@ struct LauncherApp {
 
     /// 后台线程探好的「盘符是否存在」，连接时直接用，不在 UI 线程碰 SMB。
     drive_presence: HashMap<char, bool>,
-    drive_rx: Option<Receiver<Vec<char>>>,
+    /// 后台刷新返回：最新的盘符列表 + 仍然存在的盘符
+    drive_rx: Option<Receiver<(Vec<DriveInfo>, Vec<char>)>>,
 
     form: Option<HostForm>,
     settings_draft: Option<SettingsDraft>,
@@ -300,11 +301,17 @@ struct LauncherApp {
 
 impl LauncherApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let app_start = Instant::now();
         let font_note = install_cjk_font(&cc.egui_ctx);
+        trace(&format!(
+            "new: font {:?}",
+            app_start.elapsed()
+        ));
 
         let exe_path = exe_path();
         let (mut store, store_error) = load_app_store(&exe_path);
         store.normalize();
+        trace(&format!("new: store {:?}", app_start.elapsed()));
 
         // 调试开关：命令行/脚本启动时直接切主题、视图，方便截图验证
         if let Ok(view) = std::env::var("RDP_LAUNCHER_VIEW") {
@@ -323,18 +330,26 @@ impl LauncherApp {
 
         // Windows 2026 的「未知的远程连接」警告：能静默关就静默关；
         // 普通用户需要管理员，交给顶部提示/设置里的按钮触发 UAC。
+        //
+        // 两条单次写入留在主线程（要立刻决定顶部提示）；每台主机一遍的
+        // `LocalDevices` 是 O(n) 次注册表写，挪到后台，不挡首帧——
+        // 连接前 `connect_host` 还会再写一次，晚一点没关系。
         rdp_warning::ensure_user_consent();
         let _ = rdp_warning::try_set_machine();
+        rdp_warning::ensure_auth_override();
         let host_names: Vec<(String, u16)> = store
             .hosts
             .iter()
             .map(|h| (h.host.trim().to_string(), h.port))
             .filter(|(h, _)| !h.is_empty())
             .collect();
-        rdp_warning::ensure_no_publisher_warning(&host_names);
+        if !host_names.is_empty() {
+            std::thread::spawn(move || rdp_warning::allow_hosts(&host_names));
+        }
         let show_rdp_warning_hint = !rdp_warning::is_suppressed()
             && store.settings.rdp_warning_hint
             && std::env::var_os("RDP_LAUNCHER_HIDE_WARNING_HINT").is_none();
+        trace(&format!("new: rdp_warning {:?}", app_start.elapsed()));
 
         let default_group = store.settings.default_group.clone();
         let group_filter = if !default_group.is_empty()
@@ -385,6 +400,7 @@ impl LauncherApp {
         }
 
         let drives = drives::local_drives();
+        trace(&format!("new: drives {:?}", app_start.elapsed()));
         let mut app = Self {
             store,
             exe_path,
@@ -453,6 +469,7 @@ impl LauncherApp {
             }
             _ => {}
         }
+        trace(&format!("new: ready {:?}", app_start.elapsed()));
         app
     }
 
@@ -552,7 +569,10 @@ impl LauncherApp {
         }
     }
 
-    /// 后台探一遍盘符存在性（网络盘可能卡在 SMB 上，绝不能放 UI 线程）。
+    /// 后台刷新盘符列表 + 存在性（网络盘可能卡在 SMB 上，绝不能放 UI 线程）。
+    ///
+    /// 启动时先用 `local_drives()` 的快速结果把窗口画出来（不查网络盘卷标），
+    /// 这里再补一次完整结果：卷标、插拔出来的新盘都会一起更新。
     fn refresh_drive_presence(&mut self, ctx: &egui::Context) {
         if self.drive_rx.is_some() {
             return;
@@ -568,13 +588,18 @@ impl LauncherApp {
                 }
             }
         }
-        if letters.is_empty() {
-            return;
-        }
         let (tx, rx) = channel();
         std::thread::spawn(move || {
-            let existing = drives::existing_letters(&letters);
-            let _ = tx.send(existing);
+            // 完整枚举（含网络盘卷标）和存在性探测都可能卡 SMB，一起丢后台
+            let drives = drives::local_drives_full();
+            let mut all: Vec<char> = letters;
+            for drive in &drives {
+                if !all.contains(&drive.letter) {
+                    all.push(drive.letter);
+                }
+            }
+            let existing = drives::existing_letters(&all);
+            let _ = tx.send((drives, existing));
         });
         self.drive_rx = Some(rx);
         ctx.request_repaint();
@@ -582,9 +607,13 @@ impl LauncherApp {
 
     fn drain_drive_presence(&mut self, ctx: &egui::Context) {
         let Some(rx) = &self.drive_rx else { return };
-        let Ok(existing) = rx.try_recv() else {
+        let Ok((drives, existing)) = rx.try_recv() else {
             return;
         };
+        // 盘符列表也一起换新：插拔 U 盘 / 换网络盘不用重启程序
+        if !drives.is_empty() {
+            self.drives = drives;
+        }
         let existing: std::collections::HashSet<char> = existing.into_iter().collect();
         for drive in &self.drives {
             self.drive_presence
@@ -1389,7 +1418,9 @@ impl eframe::App for LauncherApp {
 
                 ui.add_space(10.0);
 
-                if ui::draw_group_bar(ui, &pal, &self.store.groups, &mut self.group_filter) {
+                let group_changed =
+                    ui::draw_group_bar(ui, &pal, &self.store.groups, &mut self.group_filter);
+                if group_changed {
                     self.cursor = 0;
                 }
                 if self.frame_count <= 1 {
@@ -1398,8 +1429,11 @@ impl eframe::App for LauncherApp {
 
                 ui.add_space(10.0);
 
-                // 分组 / 搜索可能在本帧刚变过：重算一次，同时留给下一帧的键盘处理。
-                self.refresh_visible();
+                // 搜索 / 分组在本帧刚变过才重算：没变就用帧初那份。
+                // 排序 + 过滤是 O(n log n)，别每帧白排两遍。
+                if top.search_changed || group_changed {
+                    self.refresh_visible();
+                }
                 let visible_now = self.visible.clone();
 
                 if visible_now.is_empty() {

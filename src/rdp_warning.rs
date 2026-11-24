@@ -115,16 +115,19 @@ pub fn ensure_user_consent() {
     let _ = write_dword(HKEY_CURRENT_USER, CONSENT_KEY, CONSENT_VALUE, 1);
 }
 
-/// 压掉旧版 mstsc 的「无法识别此远程连接的发布者。是否仍要连接？」。
+/// 压掉旧版 mstsc 的「无法识别此远程连接的发布者。是否仍要连接？」的全局开关。
 ///
-/// 两个 HKCU 值（都不需要管理员）：
-/// * `AuthenticationLevelOverride=0`：全局不再做 RDP 服务器证书校验；
-/// * `LocalDevices\<主机>=0x6F`：等价于每个主机都勾了「不再询问我是否连接到此计算机」。
-///
+/// `AuthenticationLevelOverride=0`：不再做 RDP 服务器证书校验（HKCU，不需要管理员）。
 /// 这会绕过服务器证书提示，只在信任的内网使用。程序本身已经对每个 `.rdp` 写
 /// `authentication level:i:0`，这里补的是客户端每次弹窗之前那层检查。
-pub fn ensure_no_publisher_warning(hosts: &[(String, u16)]) {
+/// 单次写入很便宜，留主线程；主机自己的 `LocalDevices\<主机>` 由 `allow_hosts` 补。
+pub fn ensure_auth_override() {
     let _ = write_dword(HKEY_CURRENT_USER, TSC_KEY, AUTH_OVERRIDE, 0);
+}
+
+/// 给一批主机写「不再询问」标志（`LocalDevices\<主机> = 0x6F`）。
+/// 主机多时是 O(n) 次注册表写，启动时放后台线程调用，别挡首帧。
+pub fn allow_hosts(hosts: &[(String, u16)]) {
     for (host, port) in hosts {
         allow_host(host, *port);
     }

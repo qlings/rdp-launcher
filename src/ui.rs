@@ -93,6 +93,8 @@ pub struct TopBarOutput {
     pub open_add: bool,
     pub open_settings: bool,
     pub toggle_theme: bool,
+    /// 这一帧搜索词变了：列表要重算过滤 + 排序
+    pub search_changed: bool,
 }
 
 pub fn draw_top_bar(
@@ -107,6 +109,7 @@ pub fn draw_top_bar(
         open_add: false,
         open_settings: false,
         toggle_theme: false,
+        search_changed: false,
     };
 
     ui.horizontal(|ui| {
@@ -119,6 +122,7 @@ pub fn draw_top_bar(
                 .margin(Vec2::new(12.0, 9.0))
                 .font(FontId::proportional(15.0));
             let response = ui.add(text_edit);
+            out.search_changed = response.changed();
             if *want_focus_search {
                 response.request_focus();
                 *want_focus_search = false;

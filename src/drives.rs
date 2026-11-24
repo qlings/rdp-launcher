@@ -75,8 +75,21 @@ fn volume_label(root_wide: &[u16]) -> String {
     String::from_utf16_lossy(&name[..end]).trim().to_string()
 }
 
-/// 返回按盘符排序的驱动器列表。
+/// 返回按盘符排序的驱动器列表（**启动路径用**）。
+///
+/// 只查盘符和类型：`GetVolumeInformationW` 碰上掉线的网络盘会卡到 SMB 超时
+/// （实测能到几十秒），所以网络盘的卷标留空，交给 `local_drives_full` 在后台补。
+/// 本地盘 / U 盘 / 光驱查卷标是本地调用，很快，照常带卷标。
 pub fn local_drives() -> Vec<DriveInfo> {
+    collect(false)
+}
+
+/// 完整枚举，**包括网络盘卷标**。网络盘掉线时可能卡几十秒，只能在后台线程调用。
+pub fn local_drives_full() -> Vec<DriveInfo> {
+    collect(true)
+}
+
+fn collect(include_network_labels: bool) -> Vec<DriveInfo> {
     let mask = unsafe { GetLogicalDrives() };
     if mask == 0 {
         return fallback_probe();
@@ -110,7 +123,11 @@ pub fn local_drives() -> Vec<DriveInfo> {
             continue;
         };
 
-        let label = volume_label(&root_wide);
+        let label = if kind == DriveKind::Network && !include_network_labels {
+            String::new()
+        } else {
+            volume_label(&root_wide)
+        };
         if kind == DriveKind::Optical && label.is_empty() {
             continue;
         }
@@ -160,6 +177,13 @@ mod tests {
         let drives = local_drives();
         assert!(!drives.is_empty(), "本机至少应该有一个磁盘");
         assert!(drives.iter().any(|d| d.letter == 'C'));
+    }
+
+    #[test]
+    fn fast_and_full_enumeration_agree_on_letters() {
+        let fast: Vec<char> = local_drives().iter().map(|d| d.letter).collect();
+        let full: Vec<char> = local_drives_full().iter().map(|d| d.letter).collect();
+        assert_eq!(fast, full, "两种枚举的盘符列表应该一致");
     }
 
     #[test]
