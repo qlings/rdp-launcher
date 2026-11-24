@@ -44,9 +44,13 @@ rdp-launcher.exe      # 单文件，主机、密码、设置都在里面
 - **复制主机**：编辑界面里点「复制一份」，原样复制一台主机（地址、端口、账号、密码、
   分组、盘符、开关、序号全保留），名字后面自动加「副本」；重名自动接 2、3……
   复制品插在原主机下面，改完不用重新填一遍。
+- **导入本机历史**：设置最上面的「导入本机远程桌面历史」，把 Windows 远程桌面
+  （mstsc）连过的机器一次导入成主机；同地址同端口的会跳过。列表为空时首页上直接有这个按钮。
+- **默认值**：新增 / 导入的主机默认带剪贴板、不带声音、映射本机全部盘符。
 - **关闭后保持后台**：默认关闭；开启后关窗口只隐藏主界面，任务栏通知区域留一个小图标。
 - **托盘右键菜单**：直接把所有主机列出来（点一下直接连）/ 打开主界面 / 退出。
-- **右下角版本号**：点开「关于」，看软件说明和 `QLing 制作`。
+- **右下角版本号**：点开「关于」，看软件说明、GitHub 仓库 / 下载地址（可点击）、
+  最新版状态（自动查 GitHub，旁边可「重新检查」）和 `QLing 制作`。
 - **Windows 安全警告一键关闭**：新版 Windows 打开带重定向的 `.rdp` 会弹「未知的远程连接」；程序内置官方策略开关，管理员授权一次永久关闭。
 - **图标 / 版本信息 / DPI 清单**：都嵌在 exe 里。
 
@@ -217,24 +221,29 @@ libgallium_wgl.dll      ← 来自 software-render\
 | `src/rdp_warning.rs` | 读写 Windows RDP 重定向/发布者警告策略、UAC 提权 reg.exe |
 | `src/taskbar.rs` | 按 pid 找主窗口、关闭时收托盘（TOOLWINDOW + DeleteTab）、还原 |
 | `src/probe.rs` | 后台线程池 TCP 探活，最大并发 32，超时 800ms |
-| `src/ui.rs` | 配色、顶部栏、大分组胶囊、列表 / 方块卡片、Toast |
-| `src/dialogs.rs` | 新增/编辑主机弹窗、设置弹窗（单页，分组编辑在底部）、关于弹窗 |
+| `src/history.rs` | 读 HKCU 里 mstsc 的 MRU / Servers 历史，去重后给「导入主机」用（只读） |
+| `src/update.rs` | 「关于」里的 GitHub 最新版检查（WinHTTP，releases/latest 跳转 + API 兜底） |
+| `src/ui.rs` | 配色、顶部栏、大分组胶囊、列表 / 方块卡片、空状态、Toast |
+| `src/dialogs.rs` | 新增/编辑主机弹窗（复制一份）、设置弹窗（导入主机 / 分组编辑在底部）、关于弹窗 |
 | `src/main.rs` | 窗口、字体、主循环、快捷键、托盘、后台/退出、存储协调 |
 | `build.rs` | 用 `rc.exe` 嵌图标 / 版本信息 / DPI 清单 |
 
 依赖里新增 `tray-icon 0.24`（托盘图标 + 右键菜单），没有再引别的 UI 框架。
+最新版检查直接用系统 WinHTTP（windows crate 的 `Win32_Networking_WinHttp`），没有加 HTTP/TLS 库。
 
 ## 测试
 
 ```powershell
 cargo test
 cargo test -- --ignored real_connect_flow --nocapture   # 真连一次，会写凭据、弹 mstsc
+cargo test fetches_latest_release_from_github -- --ignored   # 真问一次 GitHub
 ```
 
-61 个单元测试（另有 1 个默认 ignore 的真连测试）覆盖：加密回环、数据流/尾部读写与 revision 选择、
+75 个单元测试（另有 2 个默认 ignore 的联网测试）覆盖：加密回环、数据流/尾部读写与 revision 选择、
 坏数据备份与「改用旧备份」提示、旧 JSON 迁移、
 最近主机去重/上限/失效清理、地址解析（域名+端口 / IPv6 / IPv6 zone id / 非法端口 / 换行注入）、空密码凭据写入/读回、粘贴地址+端口自动拆分、
-密码提示状态、同 IP 不同端口、凭据大小写不敏感共用判断、多分组过滤、三种排序、驱动器枚举、`.rdp` 的 BOM / 音频 / 盘符去重、
+密码提示状态、同 IP 不同端口、凭据大小写不敏感共用判断、多分组过滤、三种排序、复制主机（字段照搬 / 重名编号 / 插入位置）、
+历史导入（去重 / 默认值 / 跳过已存在）、版本比较与 GitHub 跳转解析、驱动器枚举、`.rdp` 的 BOM / 音频 / 盘符去重、
 凭据 TargetName 剥端口和共用凭据保护、托盘菜单结构、RDP 警告策略常量。
 `real_connect_flow` 是端到端：真写凭据、真生成 `.rdp`、真读回凭据核对、真拉起 mstsc。
 
@@ -283,7 +292,7 @@ cargo test -- --ignored real_connect_flow --nocapture   # 真连一次，会写�
 | [docs/main-grid.png](docs/main-grid.png) | 方块视图 |
 | [docs/dialog-edit.png](docs/dialog-edit.png) | 编辑主机（多分组 / 盘符 / 声音 / 序号） |
 | [docs/settings-general.png](docs/settings-general.png) | 设置 · 单页（分组编辑在最下面） |
-| [docs/about.png](docs/about.png) | 关于 / QLing 制作 |
+| [docs/about.png](docs/about.png) | 关于（GitHub / 最新版状态 / QLing 制作） |
 | [docs/warning-banner.png](docs/warning-banner.png) | 顶部「关闭 RDP 安全警告」提示 |
 | [docs/dialog-delete.png](docs/dialog-delete.png) | 编辑界面内的删除确认 |
 | [tools/shot.ps1](tools/shot.ps1) | RDP 断开时也能用的窗口截图脚本 |

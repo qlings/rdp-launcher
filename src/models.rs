@@ -255,6 +255,51 @@ pub fn duplicate_into(hosts: &mut Vec<Host>, index: usize) -> Option<usize> {
     Some(index + 1)
 }
 
+/// 把历史记录导入成主机：同地址同端口的已经在列表里就跳过。
+///
+/// 导入的主机按「剪贴板开、声音关、映射全部盘符」的默认值来，备注名留空
+/// （列表里直接显示地址），需要的话再逐台改。返回 `(导入数量, 跳过数量)`。
+pub fn import_hosts(
+    hosts: &mut Vec<Host>,
+    entries: &[(String, u16, String)],
+    drives: &[String],
+) -> (usize, usize) {
+    let mut added = 0;
+    let mut skipped = 0;
+    let mut order = hosts.iter().map(|h| h.order).max().unwrap_or(-1) + 1;
+
+    for (host, port, username) in entries {
+        let host = clean_host(host);
+        if validate_host(&host).is_err() || *port == 0 {
+            skipped += 1;
+            continue;
+        }
+        if hosts
+            .iter()
+            .any(|h| h.host.eq_ignore_ascii_case(&host) && h.port == *port)
+        {
+            skipped += 1;
+            continue;
+        }
+        hosts.push(Host {
+            id: new_id(),
+            name: String::new(),
+            host,
+            port: *port,
+            username: username.trim().to_string(),
+            password: String::new(),
+            groups: Vec::new(),
+            drives: drives.to_vec(),
+            clipboard: true,
+            audio: false,
+            order,
+        });
+        order += 1;
+        added += 1;
+    }
+    (added, skipped)
+}
+
 pub fn format_authority(host: &str, port: u16) -> String {
     let host = host.trim();
     if host.contains(':') {
@@ -685,6 +730,37 @@ mod tests {
         assert_ne!(hosts[1].id, source.id);
         assert_eq!(hosts[2].name, "B", "其它主机的位置不能被挤乱");
         assert!(duplicate_into(&mut hosts, 99).is_none());
+    }
+
+    #[test]
+    fn import_hosts_skips_existing_and_applies_defaults() {
+        let mut hosts = vec![Host {
+            id: "a".into(),
+            name: "旧主机".into(),
+            host: "10.0.0.1".into(),
+            port: 3389,
+            ..Default::default()
+        }];
+        let entries = vec![
+            ("10.0.0.1".to_string(), 3389, "admin".to_string()),
+            ("10.0.0.2".to_string(), 3390, "ql".to_string()),
+            ("10.0.0.2".to_string(), 3390, "重复".to_string()),
+            (String::new(), 3389, String::new()),
+        ];
+        let drives = vec!["C".to_string(), "D".to_string()];
+        let (added, skipped) = import_hosts(&mut hosts, &entries, &drives);
+        assert_eq!((added, skipped), (1, 3));
+        assert_eq!(hosts.len(), 2);
+
+        let imported = &hosts[1];
+        assert_eq!(imported.host, "10.0.0.2");
+        assert_eq!(imported.port, 3390);
+        assert_eq!(imported.username, "ql");
+        assert!(imported.clipboard, "导入默认带剪贴板");
+        assert!(!imported.audio, "导入默认不带声音");
+        assert_eq!(imported.drives, drives, "导入默认映射全部盘符");
+        assert!(imported.name.is_empty());
+        assert_eq!(imported.order, 1, "序号接在现有主机后面");
     }
 
     #[test]

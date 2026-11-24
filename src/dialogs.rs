@@ -6,6 +6,9 @@ use eframe::egui;
 use egui::{
     Align, Color32, CornerRadius, Frame, Layout, Margin, RichText, Stroke, Vec2,
 };
+use windows::core::PCWSTR;
+use windows::Win32::UI::Shell::ShellExecuteW;
+use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 use crate::drives::DriveInfo;
 use crate::models::{self, Group, Host, Settings, SortMode, ViewMode};
@@ -48,12 +51,11 @@ impl HostForm {
     /// `preselect`：当前正在过滤的分组。新增主机默认勾上它，
     /// 否则在「只看某个分组」时保存的新主机会直接从列表里消失。
     pub fn new_add(drives: &[DriveInfo], next_order: i64, preselect: Option<&str>) -> Self {
-        // 默认只勾 C 盘（和旧版 sync_c=true 的行为一致），但驱动器列表是本机全部
-        let default_drives = if drives.iter().any(|d| d.letter == 'C') {
-            vec!["C".to_string()]
-        } else {
-            Vec::new()
-        };
+        // 新增主机默认映射本机全部盘符、剪贴板开、声音关；不合适再逐项取消。
+        let default_drives: Vec<String> = drives
+            .iter()
+            .map(|d| d.letter.to_ascii_uppercase().to_string())
+            .collect();
         let groups = preselect
             .map(|g| g.trim())
             .filter(|g| !g.is_empty())
@@ -72,7 +74,7 @@ impl HostForm {
             group_input: String::new(),
             drives: default_drives,
             clipboard: true,
-            audio: true,
+            audio: false,
             order: next_order,
             delete_armed: false,
             delete_credential: true,
@@ -783,6 +785,9 @@ pub enum SettingsOutcome {
     None,
     Cancel,
     Save,
+    /// 点了「导入本机远程桌面历史」：由调用方真正去读注册表并落库，
+    /// 设置弹窗保持打开。
+    ImportHistory,
 }
 
 pub fn draw_settings_dialog(
@@ -825,6 +830,38 @@ pub fn draw_settings_dialog(
                 )
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
+                    section_title(ui, pal, "导入主机");
+                    ui.label(
+                        RichText::new(
+                            "把本机 Windows 远程桌面（mstsc）连过的机器一次导入成主机；\
+                             同地址同端口的会跳过，不会重复。",
+                        )
+                        .size(11.0)
+                        .color(pal.text_dim),
+                    );
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("导入本机远程桌面历史")
+                                    .size(12.0)
+                                    .color(Color32::WHITE),
+                            )
+                            .fill(pal.accent)
+                            .corner_radius(CornerRadius::same(7))
+                            .min_size(Vec2::new(0.0, 31.0)),
+                        )
+                        .on_hover_text("读 HKCU 下 mstsc 的最近连接记录，不改动 Windows 自身设置")
+                        .clicked()
+                    {
+                        outcome = SettingsOutcome::ImportHistory;
+                    }
+                    ui.label(
+                        RichText::new("导入的主机默认带剪贴板、不带声音、映射本机全部盘符，进来后可以逐台改。")
+                            .size(11.0)
+                            .color(pal.text_dim),
+                    );
+
+                    ui.add_space(12.0);
                     section_title(ui, pal, "Windows 兼容");
                     let suppressed = draft.warning_suppressed;
                     ui.label(
@@ -1243,9 +1280,21 @@ pub fn draw_settings_dialog(
 // 关于
 // ---------------------------------------------------------------------------
 
-/// 右下角版本号点开的「关于」弹窗。返回 true 表示关闭。
-pub fn draw_about_dialog(ctx: &egui::Context, pal: &Palette, version: &str) -> bool {
-    let mut close = false;
+pub enum AboutOutcome {
+    None,
+    Close,
+    /// 点了「重新检查最新版」：调用方重新发一次 GitHub 查询。
+    Recheck,
+}
+
+/// 右下角版本号点开的「关于」弹窗。
+pub fn draw_about_dialog(
+    ctx: &egui::Context,
+    pal: &Palette,
+    version: &str,
+    update: &crate::update::UpdateState,
+) -> AboutOutcome {
+    let mut outcome = AboutOutcome::None;
     egui::Modal::new(egui::Id::new("about_dialog"))
         .frame(
             Frame::new()
@@ -1256,7 +1305,7 @@ pub fn draw_about_dialog(ctx: &egui::Context, pal: &Palette, version: &str) -> b
         )
         .backdrop_color(Color32::from_black_alpha(110))
         .show(ctx, |ui| {
-            ui.set_width(440.0);
+            ui.set_width(470.0);
             ui.label(
                 RichText::new("RDP 启动器")
                     .size(21.0)
@@ -1268,7 +1317,41 @@ pub fn draw_about_dialog(ctx: &egui::Context, pal: &Palette, version: &str) -> b
                     .size(12.0)
                     .color(pal.text_dim),
             );
-            ui.add_space(10.0);
+
+            // 最新版状态：检查在后台线程里跑，这里只负责显示
+            let state_color = match update {
+                crate::update::UpdateState::Latest(_) => pal.online,
+                crate::update::UpdateState::Newer(_) => pal.accent,
+                crate::update::UpdateState::Failed(_) => pal.danger,
+                _ => pal.text_dim,
+            };
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(update.status_text())
+                        .size(12.0)
+                        .color(state_color),
+                );
+                if update.can_recheck() && small_link(ui, pal, "重新检查").clicked() {
+                    outcome = AboutOutcome::Recheck;
+                }
+            });
+
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("GitHub：").size(11.5).color(pal.text_dim));
+                url_link(ui, pal, "github.com/qlings/rdp-launcher", crate::update::REPO_URL);
+            });
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("下载：").size(11.5).color(pal.text_dim));
+                url_link(
+                    ui,
+                    pal,
+                    "github.com/qlings/rdp-launcher/releases/latest",
+                    crate::update::DOWNLOAD_URL,
+                );
+            });
+
+            ui.add_space(12.0);
             ui.label(
                 RichText::new("轻量级 Windows 远程桌面启动器")
                     .size(14.0)
@@ -1278,6 +1361,7 @@ pub fn draw_about_dialog(ctx: &egui::Context, pal: &Palette, version: &str) -> b
             for line in [
                 "单文件绿色版：主机、密码、分组、设置都加密存在 exe 里，不生成 json。",
                 "支持多分组、端口单独配置、磁盘 / 声音 / 剪贴板映射、序号排序。",
+                "支持从本机远程桌面历史一键导入主机。",
                 "支持列表 / 方块显示、关闭后保持后台、托盘右键快速连接。",
                 "内置 Windows 2026 RDP 安全警告的关闭开关。",
             ] {
@@ -1307,12 +1391,12 @@ pub fn draw_about_dialog(ctx: &egui::Context, pal: &Palette, version: &str) -> b
                         )
                         .clicked()
                     {
-                        close = true;
+                        outcome = AboutOutcome::Close;
                     }
                 });
             });
         });
-    close
+    outcome
 }
 
 // ---------------------------------------------------------------------------
@@ -1440,6 +1524,43 @@ fn small_link(ui: &mut egui::Ui, pal: &Palette, text: &str) -> egui::Response {
             .stroke(Stroke::NONE)
             .min_size(Vec2::new(0.0, 22.0)),
     )
+}
+
+fn wide(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// 用系统默认浏览器打开链接（egui 自带的链接要开 webbrowser feature，这里直接走 Shell）。
+fn open_url(url: &str) {
+    let operation = wide("open");
+    let target = wide(url);
+    // SAFETY: 两个字符串都以 NUL 结尾且在调用期间存活；窗口句柄为空也能打开。
+    unsafe {
+        let _ = ShellExecuteW(
+            windows::Win32::Foundation::HWND(std::ptr::null_mut()),
+            PCWSTR(operation.as_ptr()),
+            PCWSTR(target.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        );
+    }
+}
+
+/// 蓝色可点文字，点了用浏览器打开 `url`。
+fn url_link(ui: &mut egui::Ui, pal: &Palette, text: &str, url: &str) {
+    let response = ui
+        .add(
+            egui::Button::new(RichText::new(text).size(11.5).color(pal.accent))
+                .fill(Color32::TRANSPARENT)
+                .stroke(Stroke::NONE)
+                .min_size(Vec2::new(0.0, 22.0)),
+        )
+        .on_hover_text(format!("用浏览器打开 {url}"))
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    if response.clicked() {
+        open_url(url);
+    }
 }
 
 #[cfg(test)]

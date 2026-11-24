@@ -8,6 +8,7 @@
 mod crypto;
 mod dialogs;
 mod drives;
+mod history;
 mod models;
 mod probe;
 mod rdp;
@@ -15,6 +16,7 @@ mod rdp_warning;
 mod store;
 mod taskbar;
 mod ui;
+mod update;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -290,6 +292,10 @@ struct LauncherApp {
     /// Windows 新版 RDP 安全警告的顶部提示
     show_rdp_warning_hint: bool,
     warning_fix_pending_since: Option<Instant>,
+
+    /// 「关于」里的 GitHub 最新版检查（后台线程，UI 只轮询）
+    update_state: update::UpdateState,
+    update_rx: Option<Receiver<Result<String, String>>>,
 }
 
 impl LauncherApp {
@@ -412,6 +418,8 @@ impl LauncherApp {
             quit_requested: false,
             show_rdp_warning_hint,
             warning_fix_pending_since: None,
+            update_state: update::UpdateState::Idle,
+            update_rx: None,
         };
 
         if let Some(err) = &app.store_error {
@@ -903,6 +911,97 @@ impl LauncherApp {
         Some(name)
     }
 
+    // -----------------------------------------------------------------------
+    // 导入本机远程桌面历史
+    // -----------------------------------------------------------------------
+
+    /// 导入并把结果提示出来。设置弹窗 / 空状态里都调这个。
+    fn import_history_with_toast(&mut self, ctx: &egui::Context) {
+        let (added, skipped) = self.import_history();
+        let message = if added > 0 {
+            if skipped > 0 {
+                format!("已导入 {added} 台主机（跳过 {skipped} 台已存在或无效）")
+            } else {
+                format!("已导入 {added} 台主机")
+            }
+        } else if skipped > 0 {
+            "没有新主机可导入：历史里的机器都已经在列表里了".to_string()
+        } else {
+            "没有找到本机的远程桌面历史（在 mstsc 里连过的机器才会记录）".to_string()
+        };
+        self.push_toast(message, false);
+        ctx.request_repaint();
+    }
+
+    /// 读 HKCU 的历史记录 → 拆地址 → 按默认值（剪贴板开、声音关、全部盘符）落成主机。
+    /// 返回（实际导入数量，跳过数量：已存在 / 地址非法）。
+    fn import_history(&mut self) -> (usize, usize) {
+        let drives: Vec<String> = self
+            .drives
+            .iter()
+            .map(|d| d.letter.to_ascii_uppercase().to_string())
+            .collect();
+        let entries: Vec<(String, u16, String)> = history::local_history()
+            .into_iter()
+            .map(|entry| (entry.host, entry.port, entry.username))
+            .collect();
+        let (added, skipped) = models::import_hosts(&mut self.store.hosts, &entries, &drives);
+        if added > 0 {
+            self.store.normalize();
+            self.persist();
+            self.refresh_tray_menu();
+            self.refresh_visible();
+            // 新主机也要有状态圆点：清空结果，下一帧整批重探
+            self.statuses.clear();
+            self.probe_started = false;
+        }
+        (added, skipped)
+    }
+
+    // -----------------------------------------------------------------------
+    // 「关于」里的最新版检查
+    // -----------------------------------------------------------------------
+
+    /// `force = false` 时只在还没查过时发一次请求；`force = true` 是「重新检查」。
+    fn start_update_check(&mut self, force: bool) {
+        if self.update_rx.is_some() {
+            return;
+        }
+        if !force && !matches!(self.update_state, update::UpdateState::Idle) {
+            return;
+        }
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(update::check_latest());
+        });
+        self.update_rx = Some(rx);
+        self.update_state = update::UpdateState::Checking;
+    }
+
+    fn drain_update(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.update_rx.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                self.update_state = match result {
+                    Ok(tag) if update::is_newer(env!("CARGO_PKG_VERSION"), &tag) => {
+                        update::UpdateState::Newer(tag)
+                    }
+                    Ok(tag) => update::UpdateState::Latest(tag),
+                    Err(reason) => update::UpdateState::Failed(reason),
+                };
+                ctx.request_repaint();
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.update_state =
+                    update::UpdateState::Failed("检查线程异常退出".to_string());
+                ctx.request_repaint();
+            }
+            Err(TryRecvError::Empty) => self.update_rx = Some(rx),
+        }
+    }
+
     fn save_host(&mut self, host: Host, mode: dialogs::DialogMode, ctx: &egui::Context) {
         for group in &host.groups {
             self.store.ensure_group(group);
@@ -1111,6 +1210,7 @@ impl eframe::App for LauncherApp {
 
         self.handle_keys(ctx);
         self.drain_probe(ctx);
+        self.drain_update(ctx);
         if self.frame_count <= 1 {
             trace("update: keys/probe done");
         }
@@ -1303,12 +1403,15 @@ impl eframe::App for LauncherApp {
                 let visible_now = self.visible.clone();
 
                 if visible_now.is_empty() {
-                    ui::draw_empty_state(
+                    let import = ui::draw_empty_state(
                         ui,
                         &pal,
                         !self.search.trim().is_empty() || self.group_filter.is_some(),
                         !self.store.hosts.is_empty(),
                     );
+                    if import {
+                        self.import_history_with_toast(ctx);
+                    }
                     return;
                 }
 
@@ -1452,12 +1555,25 @@ impl eframe::App for LauncherApp {
                         self.settings_draft = Some(draft);
                     }
                 },
+                SettingsOutcome::ImportHistory => {
+                    // 设置弹窗留着，导入结果用右下角 Toast 提示
+                    self.settings_draft = Some(draft);
+                    self.import_history_with_toast(ctx);
+                }
             }
         }
 
         if self.about_open {
-            if dialogs::draw_about_dialog(ctx, &pal, env!("CARGO_PKG_VERSION")) {
-                self.about_open = false;
+            self.start_update_check(false);
+            match dialogs::draw_about_dialog(
+                ctx,
+                &pal,
+                env!("CARGO_PKG_VERSION"),
+                &self.update_state,
+            ) {
+                dialogs::AboutOutcome::None => {}
+                dialogs::AboutOutcome::Close => self.about_open = false,
+                dialogs::AboutOutcome::Recheck => self.start_update_check(true),
             }
         }
 
@@ -1477,6 +1593,11 @@ impl eframe::App for LauncherApp {
         // 探活还没收完就保持刷新节奏
         if self.probe_rx.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(120));
+        }
+
+        // 最新版检查在后台线程里跑：每 200ms 看一次回包
+        if self.update_rx.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
 
         // 隐藏到托盘时定时醒来排空托盘事件队列，防止某些环境下 repaint 没唤醒

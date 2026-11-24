@@ -942,18 +942,62 @@ pub fn draw_footer(
     about_clicked
 }
 
-pub fn draw_empty_state(ui: &mut egui::Ui, pal: &Palette, filtered: bool, has_hosts: bool) {
+/// 空状态：没有主机时同时提示「新增」和「导入本机历史」。
+/// 返回 true 表示用户点了「导入本机远程桌面历史」。
+pub fn draw_empty_state(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    filtered: bool,
+    has_hosts: bool,
+) -> bool {
+    let mut import_clicked = false;
     ui.vertical_centered(|ui| {
-        ui.add_space(70.0);
-        let text = if !has_hosts {
-            "还没有主机\n点右上角「+ 新增主机」开始"
+        ui.add_space(56.0);
+        if !has_hosts {
+            ui.label(
+                RichText::new("还没有主机")
+                    .size(16.0)
+                    .strong()
+                    .color(pal.text),
+            );
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new("点右上角「+ 新增主机」新建，或导入本机远程桌面里连过的机器：")
+                    .size(12.5)
+                    .color(pal.text_dim),
+            );
+            ui.add_space(14.0);
+            if ui
+                .add(
+                    egui::Button::new(
+                        RichText::new("导入本机远程桌面历史")
+                            .size(12.5)
+                            .color(Color32::WHITE),
+                    )
+                    .fill(pal.accent)
+                    .corner_radius(CornerRadius::same(8))
+                    .min_size(Vec2::new(0.0, 34.0)),
+                )
+                .on_hover_text("读 mstsc 的最近连接记录，一次导入成主机")
+                .clicked()
+            {
+                import_clicked = true;
+            }
         } else if filtered {
-            "没有匹配的主机\n换个关键词，或点「全部」清掉分组过滤"
+            ui.label(
+                RichText::new("没有匹配的主机\n换个关键词，或点「全部」清掉分组过滤")
+                    .size(13.5)
+                    .color(pal.text_dim),
+            );
         } else {
-            "这个分组里还没有主机\n编辑主机时可以同时勾选多个分组"
-        };
-        ui.label(RichText::new(text).size(13.5).color(pal.text_dim));
+            ui.label(
+                RichText::new("这个分组里还没有主机\n编辑主机时可以同时勾选多个分组")
+                    .size(13.5)
+                    .color(pal.text_dim),
+            );
+        }
     });
+    import_clicked
 }
 
 pub struct Toast {
