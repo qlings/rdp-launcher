@@ -224,6 +224,37 @@ impl Host {
     }
 }
 
+/// 复制一份时用的名字：原备注名后面加「副本」；这个名字已经被占了就继续加 2、3……
+///
+/// 备注名为空时用 `display_name()`（也就是主机地址），复制出来仍然认得出是哪台。
+pub fn copy_name(host: &Host, existing: &[Host]) -> String {
+    let base = host.display_name().trim().to_string();
+    let mut candidate = format!("{base}副本");
+    let mut n = 2u32;
+    while existing.iter().any(|h| h.name.trim() == candidate) && n <= 999 {
+        candidate = format!("{base}副本{n}");
+        n += 1;
+    }
+    candidate
+}
+
+/// 原样复制一台主机：只换 id、改名字，其余字段（地址、端口、账号、密码、分组、
+/// 盘符、剪贴板 / 声音、序号）一个不动。
+pub fn duplicate(host: &Host, existing: &[Host]) -> Host {
+    let mut copy = host.clone();
+    copy.id = new_id();
+    copy.name = copy_name(host, existing);
+    copy
+}
+
+/// 原样复制并插在原主机后面（列表里紧挨着），返回新主机在 `hosts` 里的下标。
+pub fn duplicate_into(hosts: &mut Vec<Host>, index: usize) -> Option<usize> {
+    let source = hosts.get(index)?.clone();
+    let copy = duplicate(&source, hosts);
+    hosts.insert(index + 1, copy);
+    Some(index + 1)
+}
+
 pub fn format_authority(host: &str, port: u16) -> String {
     let host = host.trim();
     if host.contains(':') {
@@ -572,6 +603,88 @@ mod tests {
         assert_eq!(visible_indices(&hosts, "公司", None, SortMode::Name), vec![0]);
         assert_eq!(visible_indices(&hosts, "3390", None, SortMode::Name), vec![0]);
         assert!(visible_indices(&hosts, "3391", None, SortMode::Name).is_empty());
+    }
+
+    #[test]
+    fn duplicate_keeps_every_field_but_id_and_name() {
+        let source = Host {
+            id: "a".into(),
+            name: "办公室主力机".into(),
+            host: "10.0.0.5".into(),
+            port: 3390,
+            username: "Admin".into(),
+            password: "secret".into(),
+            groups: vec!["公司".into(), "测试".into()],
+            drives: vec!["C".into(), "D".into()],
+            clipboard: false,
+            audio: false,
+            order: 7,
+        };
+        let copy = duplicate(&source, std::slice::from_ref(&source));
+        assert_eq!(copy.name, "办公室主力机副本");
+        assert_ne!(copy.id, source.id);
+        assert_eq!(copy.host, source.host);
+        assert_eq!(copy.port, source.port);
+        assert_eq!(copy.username, source.username);
+        assert_eq!(copy.password, source.password);
+        assert_eq!(copy.groups, source.groups);
+        assert_eq!(copy.drives, source.drives);
+        assert_eq!(copy.clipboard, source.clipboard);
+        assert_eq!(copy.audio, source.audio);
+        assert_eq!(copy.order, source.order);
+    }
+
+    #[test]
+    fn duplicate_names_are_numbered_when_taken() {
+        let source = Host {
+            id: "a".into(),
+            name: "A".into(),
+            host: "10.0.0.1".into(),
+            ..Default::default()
+        };
+        let copy1 = duplicate(&source, std::slice::from_ref(&source));
+        assert_eq!(copy1.name, "A副本");
+
+        let mut hosts = vec![source, copy1];
+        let copy2 = duplicate(&hosts[0], &hosts);
+        assert_eq!(copy2.name, "A副本2");
+        hosts.push(copy2);
+        let copy3 = duplicate(&hosts[0], &hosts);
+        assert_eq!(copy3.name, "A副本3");
+    }
+
+    #[test]
+    fn duplicate_of_unnamed_host_uses_address_as_base() {
+        let source = Host {
+            id: "a".into(),
+            host: "10.0.0.9".into(),
+            ..Default::default()
+        };
+        assert_eq!(duplicate(&source, &[]).name, "10.0.0.9副本");
+    }
+
+    #[test]
+    fn duplicate_into_inserts_right_after_source() {
+        let source = Host {
+            id: "a".into(),
+            name: "A".into(),
+            host: "10.0.0.1".into(),
+            ..Default::default()
+        };
+        let other = Host {
+            id: "b".into(),
+            name: "B".into(),
+            host: "10.0.0.2".into(),
+            ..Default::default()
+        };
+        let mut hosts = vec![source.clone(), other];
+        let at = duplicate_into(&mut hosts, 0).unwrap();
+        assert_eq!(at, 1);
+        assert_eq!(hosts[1].name, "A副本");
+        assert_eq!(hosts[1].host, "10.0.0.1");
+        assert_ne!(hosts[1].id, source.id);
+        assert_eq!(hosts[2].name, "B", "其它主机的位置不能被挤乱");
+        assert!(duplicate_into(&mut hosts, 99).is_none());
     }
 
     #[test]

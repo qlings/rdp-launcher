@@ -881,6 +881,28 @@ impl LauncherApp {
         self.push_toast(format!("已删除「{}」{suffix}", host.display_name()), false);
     }
 
+    /// 复制一台主机：原样复制，名字加「副本」（重名自动加编号），插在原主机后面。
+    /// 返回复制出来的新名字。
+    fn duplicate_host(&mut self, index: usize) -> Option<String> {
+        let source_id = self.store.hosts.get(index)?.id.clone();
+        let at = models::duplicate_into(&mut self.store.hosts, index)?;
+        let copy = self.store.hosts.get(at)?;
+        let id = copy.id.clone();
+        let name = copy.name.clone();
+        self.store.normalize();
+        // 地址、端口没变，探活结果直接沿用，不用再探一次
+        if let Some(status) = self.statuses.get(&source_id).copied() {
+            self.statuses.insert(id.clone(), status);
+        }
+        self.persist();
+        self.refresh_tray_menu();
+        self.refresh_visible();
+        if let Some(pos) = self.visible.iter().position(|&i| self.store.hosts[i].id == id) {
+            self.cursor = pos;
+        }
+        Some(name)
+    }
+
     fn save_host(&mut self, host: Host, mode: dialogs::DialogMode, ctx: &egui::Context) {
         for group in &host.groups {
             self.store.ensure_group(group);
@@ -1391,6 +1413,13 @@ impl eframe::App for LauncherApp {
                 HostDialogOutcome::Save(host) => {
                     let mode = form.mode;
                     self.save_host(host, mode, ctx);
+                }
+                HostDialogOutcome::Copy { index } => {
+                    match self.duplicate_host(index) {
+                        Some(name) => self.push_toast(format!("已复制为「{name}」"), false),
+                        None => self.push_toast("要复制的主机已经不存在了", true),
+                    }
+                    ctx.request_repaint();
                 }
                 HostDialogOutcome::Delete {
                     index,

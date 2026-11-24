@@ -180,6 +180,10 @@ pub enum HostDialogOutcome {
     None,
     Cancel,
     Save(Host),
+    /// 编辑界面里点了「复制一份」：调用方按这个下标把主机原样复制一份（名字加「副本」）。
+    Copy {
+        index: usize,
+    },
     Delete {
         index: usize,
         host_id: String,
@@ -601,7 +605,7 @@ pub fn draw_host_dialog(
                     }
 
                     ui.horizontal(|ui| {
-                        if editing_index.is_some() && !form.delete_armed {
+                        if let Some(index) = editing_index.filter(|_| !form.delete_armed) {
                             if ui
                                 .add(
                                     egui::Button::new(
@@ -615,6 +619,24 @@ pub fn draw_host_dialog(
                                 .clicked()
                             {
                                 form.delete_armed = true;
+                            }
+                            ui.add_space(6.0);
+                            // 原样复制一份：地址、端口、账号、密码、分组、盘符、开关、序号全带走，
+                            // 名字后面加「副本」，插在原主机后面
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new("复制一份").size(12.0).color(pal.accent),
+                                    )
+                                    .fill(Color32::TRANSPARENT)
+                                    .stroke(Stroke::new(1.0_f32, pal.accent))
+                                    .corner_radius(CornerRadius::same(7))
+                                    .min_size(Vec2::new(86.0, 34.0)),
+                                )
+                                .on_hover_text("按原样复制这台主机，名字后面加「副本」")
+                                .clicked()
+                            {
+                                outcome = HostDialogOutcome::Copy { index };
                             }
                         }
 
@@ -1348,12 +1370,18 @@ fn text_input(
     response
 }
 
-/// 同地址 + 同端口已经存在（地址大小写不敏感），返回那台重复的主机。
+/// 新增主机时的查重：同地址 + 同端口已经存在（地址大小写不敏感），返回那台重复的主机。
+///
+/// 编辑已保存的主机时不查重：复制出来的主机本来就和原主机同地址同端口，
+/// 还拦着的话连改个名字都保存不了。
 fn find_duplicate<'a>(
     others: &'a [Host],
     editing_index: Option<usize>,
     host: &Host,
 ) -> Option<&'a Host> {
+    if editing_index.is_some() {
+        return None;
+    }
     others.iter().enumerate().find_map(|(i, other)| {
         (Some(i) != editing_index
             && other.host.eq_ignore_ascii_case(host.host.trim())
@@ -1582,6 +1610,8 @@ mod tests {
         candidate.port = 3389;
         // 编辑自己不算重复
         assert!(find_duplicate(std::slice::from_ref(&existing), Some(0), &candidate).is_none());
+        // 编辑一台主机时，同地址同端口的另一台（复制出来的副本）也不再拦
+        assert!(find_duplicate(std::slice::from_ref(&existing), Some(1), &candidate).is_none());
     }
 
     #[test]
