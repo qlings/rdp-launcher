@@ -34,10 +34,12 @@ use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HWND};
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
 
-use dialogs::{HostDialogOutcome, HostForm, SettingsDraft, SettingsOutcome};
+use dialogs::{
+    HostDialogOutcome, HostForm, ImportDraft, ImportOutcome, SettingsDraft, SettingsOutcome,
+};
 use drives::DriveInfo;
 use models::Host;
-use probe::{ProbeStatus, StatusMap};
+use probe::ProbeStatus;
 use store::Store as StoreData;
 use ui::{Palette, RowAction};
 
@@ -203,13 +205,21 @@ fn install_cjk_font(ctx: &egui::Context) -> Option<String> {
 fn build_tray_menu(store: &StoreData) -> Menu {
     let menu = Menu::new();
 
-    // 右键直接列主机，不再套「最近主机」子菜单，少一次点击。
-    let order = models::visible_indices(&store.hosts, "", None, store.settings.sort);
-    if order.is_empty() {
+    // 托盘右键是「快速连接」，不是主机管理器：只列最近用过的 3 台，
+    // 一条都没连过就按当前排序补满，剩下的进主界面看。
+    let picked = models::quick_host_indices(
+        &store.hosts,
+        &store.recent,
+        store.settings.sort,
+        models::QUICK_CONNECT_LIMIT,
+    );
+    if picked.is_empty() {
         let empty = MenuItem::with_id("hosts-empty", "（还没有主机）", false, None);
         let _ = menu.append(&empty);
     } else {
-        for index in order {
+        let header = MenuItem::with_id("recent-header", "最近连接", false, None);
+        let _ = menu.append(&header);
+        for index in picked {
             let host = &store.hosts[index];
             let label = format!("{}  —  {}", host.display_name(), host.display_address())
                 .replace('&', "&&");
@@ -219,7 +229,7 @@ fn build_tray_menu(store: &StoreData) -> Menu {
     }
 
     let _ = menu.append(&PredefinedMenuItem::separator());
-    let open = MenuItem::with_id("open", "打开主界面", true, None);
+    let open = MenuItem::with_id("open", "打开主界面（全部主机）", true, None);
     let _ = menu.append(&open);
     let quit = MenuItem::with_id("quit", "退出", true, None);
     let _ = menu.append(&quit);
@@ -245,13 +255,13 @@ struct LauncherApp {
     group_filter: Option<String>,
     /// 在**过滤后**列表里的下标
     cursor: usize,
-    /// 本帧的过滤 + 排序结果（每帧最多算两次，键盘/行循环共用）
+    /// 本帧的过滤 + 排序结果（只在搜索 / 分组 / 主机集合变了时才重算）
     visible: Vec<usize>,
+    /// `visible` 需要重算（搜索、分组、排序、增删改都会置位）
+    visible_dirty: bool,
 
-    statuses: StatusMap,
-    probe_rx: Option<Receiver<(String, bool)>>,
-    /// 整批探活的截止时间：DNS 卡住时也要能停下来。
-    probe_deadline: Option<Instant>,
+    /// 探活：状态缓存 + 进行中的批次 + 上次完成时间，全在 ProbeRunner 里
+    probe: probe::ProbeRunner,
 
     /// 后台线程探好的「盘符是否存在」，连接时直接用，不在 UI 线程碰 SMB。
     drive_presence: HashMap<char, bool>,
@@ -260,6 +270,8 @@ struct LauncherApp {
 
     form: Option<HostForm>,
     settings_draft: Option<SettingsDraft>,
+    /// 「导入本机远程桌面历史」的多选弹窗
+    import_draft: Option<ImportDraft>,
     about_open: bool,
     toasts: Vec<ui::Toast>,
 
@@ -273,7 +285,6 @@ struct LauncherApp {
     want_focus_search: bool,
     /// 键盘上下移动后把选中项滚进视野，画完一帧清掉
     scroll_to_cursor: bool,
-    probe_started: bool,
     /// 调试用：RDP_LAUNCHER_AUTOCONNECT=1 时启动后自动连第一台
     autoconnect: bool,
     /// 自己数帧：egui 0.31 的 Context 没有 frame_nr()
@@ -326,6 +337,14 @@ impl LauncherApp {
         }
         if let Ok(flag) = std::env::var("RDP_LAUNCHER_CLOSE_TO_TRAY") {
             store.settings.close_to_tray = flag != "0";
+        }
+        // 排障 / 自测用：不改配置，临时把探活刷新间隔换成设置里允许的另一档
+        if let Ok(raw) = std::env::var("RDP_LAUNCHER_PROBE_INTERVAL") {
+            if let Ok(secs) = raw.parse::<u64>() {
+                if models::PROBE_INTERVALS.contains(&secs) {
+                    store.settings.probe_interval_secs = secs;
+                }
+            }
         }
 
         // Windows 2026 的「未知的远程连接」警告：能静默关就静默关；
@@ -409,13 +428,13 @@ impl LauncherApp {
             group_filter,
             cursor: 0,
             visible: Vec::new(),
-            statuses: StatusMap::new(),
-            probe_rx: None,
-            probe_deadline: None,
+            visible_dirty: true,
+            probe: probe::ProbeRunner::new(),
             drive_presence: HashMap::new(),
             drive_rx: None,
             form: None,
             settings_draft: None,
+            import_draft: None,
             about_open: false,
             toasts: Vec::new(),
             dirty: false,
@@ -423,7 +442,6 @@ impl LauncherApp {
             last_dark: None,
             want_focus_search: true,
             scroll_to_cursor: false,
-            probe_started: false,
             autoconnect: std::env::var_os("RDP_LAUNCHER_AUTOCONNECT").is_some(),
             frame_count: 0,
             store_error,
@@ -463,6 +481,11 @@ impl LauncherApp {
                 }
             }
             Ok("settings") => app.settings_draft = Some(SettingsDraft::new(&app.store)),
+            Ok("import") => {
+                // 截图/自测用：设置弹窗 + 叠在上面的导入多选弹窗
+                app.settings_draft = Some(SettingsDraft::new(&app.store));
+                app.import_draft = Some(ImportDraft::from_local(&app.store));
+            }
             Ok("about") => app.about_open = true,
             Ok("toast") => {
                 app.push_toast("已启动远程桌面：办公室主力机", false);
@@ -494,6 +517,7 @@ impl LauncherApp {
     /// 搜索 / 分组 / 排序 / 主机集合变了就重算一次，并夹住光标。
     fn refresh_visible(&mut self) {
         self.visible = self.compute_visible();
+        self.visible_dirty = false;
         if !self.visible.is_empty() && self.cursor >= self.visible.len() {
             self.cursor = self.visible.len() - 1;
         }
@@ -503,69 +527,102 @@ impl LauncherApp {
         self.visible.get(self.cursor).copied()
     }
 
-    /// 主窗口已经画出来了，才开始探活。
-    fn start_probe(&mut self, ctx: &egui::Context) {
-        self.statuses.clear();
-        self.probe_rx = None;
-        self.probe_deadline = None;
+    /// 发一轮全量探活。
+    ///
+    /// `keep` = true 时保留上一次的结果（定时/手动刷新，圆点不会整排变灰）；
+    /// false 用于首次探测或整批作废（关掉探活再打开、导入后重来）。
+    fn start_probe(&mut self, ctx: &egui::Context, keep: bool) {
         if !self.store.settings.probe || self.store.hosts.is_empty() {
+            self.probe.clear();
             ctx.request_repaint();
             return;
         }
-        let (tx, rx) = channel();
+        if keep {
+            let alive: std::collections::HashSet<String> =
+                self.store.hosts.iter().map(|h| h.id.clone()).collect();
+            self.probe.prune(&alive);
+        } else {
+            self.probe.clear();
+        }
         // 只传 id / 地址 / 端口，不把带明文密码的整个 Host 复制进线程池
-        probe::spawn_probe_batch(probe::targets_of(&self.store.hosts), tx);
-        self.probe_rx = Some(rx);
-        self.probe_deadline = Some(Instant::now() + probe::BATCH_DEADLINE);
+        let targets = probe::targets_of(&self.store.hosts);
+        let count = targets.len();
+        self.probe.start(targets);
+        trace(&format!("probe: start {count} hosts (keep={keep})"));
         ctx.request_repaint();
     }
 
+    /// 只探测这几台（新增 / 改地址 / 导入之后），其它主机的结果原样留着。
+    fn probe_hosts(&mut self, ids: &[String], ctx: &egui::Context) {
+        if !self.store.settings.probe || ids.is_empty() {
+            return;
+        }
+        if self.probe.last_finished().is_none() {
+            // 还没有过整轮结果：顺手全测一遍，别让其它主机一直挂在「检测中」
+            self.start_probe(ctx, true);
+            return;
+        }
+        let targets = probe::targets_for(&self.store.hosts, ids);
+        if targets.is_empty() {
+            return;
+        }
+        self.probe.start(targets);
+        ctx.request_repaint();
+    }
+
+    /// 到点自动刷新：窗口藏着的时候不刷（托盘里看不到圆点，白费电）。
+    ///
+    /// 首轮（还没测过）一定会测，即使设置了「不自动」；之后按间隔来。
+    fn maybe_auto_probe(&mut self, ctx: &egui::Context) {
+        if self.frame_count < 2 {
+            // 第一帧只画界面：窗口先出来，再谈连不连得上
+            return;
+        }
+        if !self.store.settings.probe || self.hidden_to_tray {
+            return;
+        }
+        if self.probe.is_running() || self.store.hosts.is_empty() {
+            return;
+        }
+        let interval = self.store.settings.probe_interval_secs;
+        let first_run = self.probe.last_finished().is_none();
+        let due = first_run
+            || (interval > 0
+                && self
+                    .probe
+                    .last_finished()
+                    .is_some_and(|last| last.elapsed().as_secs() >= interval));
+        if due {
+            self.start_probe(ctx, !first_run);
+        }
+    }
+
+    /// 界面闲着不会自己重绘：按刷新间隔预约一次唤醒，自动刷新才能真的发生。
+    fn schedule_probe_wakeup(&self, ctx: &egui::Context) {
+        let interval = self.store.settings.probe_interval_secs;
+        if !self.store.settings.probe || interval == 0 || self.hidden_to_tray {
+            return;
+        }
+        let wait = match self.probe.last_finished() {
+            Some(last) => Duration::from_secs(interval.saturating_sub(last.elapsed().as_secs()).max(1)),
+            None => Duration::from_secs(1),
+        };
+        ctx.request_repaint_after(wait);
+    }
+
     fn drain_probe(&mut self, ctx: &egui::Context) {
-        let mut changed = false;
-        let mut finished = false;
-        if let Some(rx) = &self.probe_rx {
-            loop {
-                match rx.try_recv() {
-                    Ok((id, online)) => {
-                        self.statuses.insert(
-                            id,
-                            if online {
-                                ProbeStatus::Online
-                            } else {
-                                ProbeStatus::Offline
-                            },
-                        );
-                        changed = true;
-                    }
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        finished = true;
-                        break;
-                    }
-                }
-            }
-        }
-        // DNS 卡住时 worker 可能很久不返回：到点就收摊，没出结果的按离线算，
-        // 不然会一直「检测中」并且每 120ms 空转重绘。
-        let timed_out = !finished
-            && self
-                .probe_deadline
-                .is_some_and(|deadline| Instant::now() >= deadline);
-        if timed_out {
-            for host in &self.store.hosts {
-                self.statuses
-                    .entry(host.id.clone())
-                    .or_insert(ProbeStatus::Offline);
-            }
-            finished = true;
-            changed = true;
-        }
-        if finished {
-            self.probe_rx = None;
-            self.probe_deadline = None;
-        }
-        if changed {
+        let was_running = self.probe.is_running();
+        if self.probe.poll() {
             ctx.request_repaint();
+        }
+        if was_running && !self.probe.is_running() {
+            trace(&format!(
+                "probe: batch finished, online {}",
+                self.probe.online_count()
+            ));
+        }
+        if self.probe.is_running() {
+            ctx.request_repaint_after(Duration::from_millis(120));
         }
     }
 
@@ -632,8 +689,10 @@ impl LauncherApp {
     }
 
     /// 标记有改动，1.2 秒后（或退出/收托盘时）真正落盘。
+    /// 顺手把列表标记成要重算：主机、分组、排序都可能是这次改的。
     fn persist(&mut self) {
         self.dirty = true;
+        self.visible_dirty = true;
     }
 
     /// 立刻落盘。返回是否成功；失败会在界面上留常驻红条。
@@ -690,7 +749,10 @@ impl LauncherApp {
             Ok(outcome) => {
                 self.store.touch_recent(&host.id);
                 self.persist();
-                // 托盘菜单只列主机和排序，连接本身不改变内容：不必每次重建整个原生菜单。
+                // 连上了就是在线：圆点立刻变绿，不用等下一轮探测。
+                self.probe.mark_online(&host.id);
+                // 托盘「最近连接」跟着换顺序，必须重建原生菜单。
+                self.refresh_tray_menu();
 
                 let mut msg = format!("已启动远程桌面：{}", host.display_name());
                 if !outcome.missing_drives.is_empty() {
@@ -900,7 +962,7 @@ impl LauncherApp {
         } else {
             false
         };
-        self.statuses.remove(&host.id);
+        self.probe.forget(&host.id);
         self.refresh_visible();
         let len = self.visible.len();
         if len == 0 {
@@ -928,9 +990,7 @@ impl LauncherApp {
         let name = copy.name.clone();
         self.store.normalize();
         // 地址、端口没变，探活结果直接沿用，不用再探一次
-        if let Some(status) = self.statuses.get(&source_id).copied() {
-            self.statuses.insert(id.clone(), status);
-        }
+        self.probe.copy_status(&source_id, &id);
         self.persist();
         self.refresh_tray_menu();
         self.refresh_visible();
@@ -944,47 +1004,39 @@ impl LauncherApp {
     // 导入本机远程桌面历史
     // -----------------------------------------------------------------------
 
-    /// 导入并把结果提示出来。设置弹窗 / 空状态里都调这个。
-    fn import_history_with_toast(&mut self, ctx: &egui::Context) {
-        let (added, skipped) = self.import_history();
-        let message = if added > 0 {
-            if skipped > 0 {
-                format!("已导入 {added} 台主机（跳过 {skipped} 台已存在或无效）")
-            } else {
-                format!("已导入 {added} 台主机")
-            }
-        } else if skipped > 0 {
-            "没有新主机可导入：历史里的机器都已经在列表里了".to_string()
-        } else {
-            "没有找到本机的远程桌面历史（在 mstsc 里连过的机器才会记录）".to_string()
-        };
-        self.push_toast(message, false);
+    /// 打开「导入主机」多选弹窗。历史是当场读的，读不到就在弹窗里说清楚。
+    fn open_import_dialog(&mut self, ctx: &egui::Context) {
+        self.import_draft = Some(ImportDraft::from_local(&self.store));
         ctx.request_repaint();
     }
 
-    /// 读 HKCU 的历史记录 → 拆地址 → 按默认值（剪贴板开、声音关、全部盘符）落成主机。
-    /// 返回（实际导入数量，跳过数量：已存在 / 地址非法）。
-    fn import_history(&mut self) -> (usize, usize) {
+    /// 把用户勾好的历史落成主机，并只探测这几台新主机。
+    fn apply_import(&mut self, entries: Vec<(String, u16, String)>, ctx: &egui::Context) {
         let drives: Vec<String> = self
             .drives
             .iter()
             .map(|d| d.letter.to_ascii_uppercase().to_string())
             .collect();
-        let entries: Vec<(String, u16, String)> = history::local_history()
-            .into_iter()
-            .map(|entry| (entry.host, entry.port, entry.username))
-            .collect();
-        let (added, skipped) = models::import_hosts(&mut self.store.hosts, &entries, &drives);
+        let report = models::import_hosts(&mut self.store.hosts, &entries, &drives);
+        let added = report.added_count();
         if added > 0 {
             self.store.normalize();
             self.persist();
             self.refresh_tray_menu();
             self.refresh_visible();
-            // 新主机也要有状态圆点：清空结果，下一帧整批重探
-            self.statuses.clear();
-            self.probe_started = false;
+            self.probe_hosts(&report.added, ctx);
         }
-        (added, skipped)
+        let message = if added > 0 {
+            if report.skipped > 0 {
+                format!("已导入 {added} 台主机（跳过 {} 台已存在或无效）", report.skipped)
+            } else {
+                format!("已导入 {added} 台主机")
+            }
+        } else {
+            "没有导入任何主机（都已在列表里或地址无效）".to_string()
+        };
+        self.push_toast(message, added == 0);
+        ctx.request_repaint();
     }
 
     // -----------------------------------------------------------------------
@@ -1036,8 +1088,14 @@ impl LauncherApp {
             self.store.ensure_group(group);
         }
         let id = host.id.clone();
+        // 地址 / 端口变了，旧的在线结论就没意义了；只重测这一台，别把整批作废。
+        let mut address_changed = true;
         match mode {
             dialogs::DialogMode::Edit(index) => {
+                if let Some(old) = self.store.hosts.get(index) {
+                    address_changed =
+                        !old.host.eq_ignore_ascii_case(host.host.trim()) || old.port != host.port;
+                }
                 if index < self.store.hosts.len() {
                     self.store.hosts[index] = host;
                 }
@@ -1047,9 +1105,9 @@ impl LauncherApp {
         self.store.normalize();
         self.persist();
         self.refresh_tray_menu();
-        // 地址 / 端口可能改了，状态全部作废重测
-        self.statuses.clear();
-        self.probe_started = false;
+        if address_changed {
+            self.probe.invalidate(std::slice::from_ref(&id));
+        }
         self.refresh_visible();
 
         if let Some(pos) = self
@@ -1060,6 +1118,9 @@ impl LauncherApp {
             self.cursor = pos;
         }
         self.push_toast("已保存", false);
+        if address_changed {
+            self.probe_hosts(std::slice::from_ref(&id), ctx);
+        }
         // 新勾的盘符也要有存在性记录，连接时才不会乐观地把不存在的盘写进去
         self.refresh_drive_presence(ctx);
         ctx.request_repaint();
@@ -1090,15 +1151,12 @@ impl LauncherApp {
         }
 
         match (probe_was_on, self.store.settings.probe) {
-            (true, false) => {
-                self.statuses.clear();
-                self.probe_rx = None;
-                self.probe_deadline = None;
-                self.probe_started = true;
-            }
+            // 关掉探活：状态和进行中的批次一起丢
+            (true, false) => self.probe.clear(),
+            // 重新打开：立刻测一轮，不用等下一个自动刷新点
             (false, true) => {
-                self.statuses.clear();
-                self.probe_started = false;
+                self.probe.clear();
+                self.start_probe(ctx, false);
             }
             _ => {}
         }
@@ -1129,7 +1187,13 @@ impl LauncherApp {
     fn handle_keys(&mut self, ctx: &egui::Context) {
         use egui::{Key, Modifiers};
 
-        // 弹窗打开时：Esc 关弹窗，其它键留给弹窗里的输入框
+        // 弹窗打开时：Esc 关最上面那层，其它键留给弹窗里的输入框
+        if self.import_draft.is_some() {
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+                self.import_draft = None;
+            }
+            return;
+        }
         if self.form.is_some() || self.settings_draft.is_some() || self.about_open {
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
                 self.form = None;
@@ -1154,6 +1218,14 @@ impl LauncherApp {
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter)) {
             if filtered_len > 0 {
                 self.connect_selected(ctx);
+            }
+        }
+        // F5：立刻重新检测一轮（不用等自动刷新）
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F5)) {
+            if self.store.settings.probe {
+                self.start_probe(ctx, true);
+            } else {
+                self.push_toast("探活已在设置里关闭，打开后就能检测", true);
             }
         }
         if ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, Key::N)) {
@@ -1220,15 +1292,16 @@ impl eframe::App for LauncherApp {
 
         // 第一帧只画界面，第二帧才开始后台探活：先把窗口亮出来，再谈连不连得上。
         self.frame_count = self.frame_count.saturating_add(1);
-        if !self.probe_started && self.frame_count >= 2 {
-            self.probe_started = true;
-            self.start_probe(ctx);
-        }
         if self.frame_count == 2 {
             self.refresh_drive_presence(ctx);
         }
 
-        self.refresh_visible();
+        if self.visible_dirty {
+            self.refresh_visible();
+        }
+
+        // 探活：首轮在这里发出，之后由 maybe_auto_probe 按设置的间隔刷新。
+        self.maybe_auto_probe(ctx);
 
         if self.autoconnect && self.frame_count >= 2 {
             self.autoconnect = false;
@@ -1251,7 +1324,7 @@ impl eframe::App for LauncherApp {
 
         // 隐藏到托盘时不用画：探活在后台继续跑，圆点下次还原时自然是最新的。
         if self.hidden_to_tray && self.toasts.is_empty() {
-            let tick = if self.probe_rx.is_some() {
+            let tick = if self.probe.is_running() {
                 Duration::from_millis(120)
             } else {
                 Duration::from_millis(250)
@@ -1389,6 +1462,19 @@ impl eframe::App for LauncherApp {
                     ui.add_space(8.0);
                 }
 
+                let probe_summary = ui::ProbeSummary {
+                    enabled: self.store.settings.probe,
+                    online: self.probe.online_count(),
+                    // 没填地址的主机不参与探测，别让它把「在线 x/y」永远拉不满
+                    total: self
+                        .store
+                        .hosts
+                        .iter()
+                        .filter(|h| !h.host.trim().is_empty())
+                        .count(),
+                    checking: self.probe.is_running(),
+                    since_last: self.probe.last_finished().map(|last| last.elapsed()),
+                };
                 let top = ui::draw_top_bar(
                     ui,
                     &pal,
@@ -1396,6 +1482,7 @@ impl eframe::App for LauncherApp {
                     self.store.settings.show_search,
                     &mut self.want_focus_search,
                     self.store.settings.dark,
+                    probe_summary,
                 );
                 if top.open_add {
                     self.refresh_drive_presence(ctx);
@@ -1411,6 +1498,15 @@ impl eframe::App for LauncherApp {
                 if top.toggle_theme {
                     self.store.settings.dark = !self.store.settings.dark;
                     self.persist();
+                }
+                if top.refresh_probe {
+                    if self.store.settings.probe {
+                        self.start_probe(ctx, true);
+                        self.push_toast("正在重新检测主机状态…", false);
+                    } else {
+                        self.settings_draft = Some(SettingsDraft::new(&self.store));
+                        self.push_toast("先在设置里打开「探测可用性」", true);
+                    }
                 }
                 if self.frame_count <= 1 {
                     trace("central: topbar done");
@@ -1434,7 +1530,9 @@ impl eframe::App for LauncherApp {
                 if top.search_changed || group_changed {
                     self.refresh_visible();
                 }
-                let visible_now = self.visible.clone();
+                // 列表只需要一份下标，不每帧 clone：借用冲突的地方（行循环里要 &mut self）
+                // 用 take / 放回解决。
+                let visible_now = std::mem::take(&mut self.visible);
 
                 if visible_now.is_empty() {
                     let import = ui::draw_empty_state(
@@ -1444,8 +1542,9 @@ impl eframe::App for LauncherApp {
                         !self.store.hosts.is_empty(),
                     );
                     if import {
-                        self.import_history_with_toast(ctx);
+                        self.open_import_dialog(ctx);
                     }
+                    self.visible = visible_now;
                     return;
                 }
 
@@ -1520,6 +1619,8 @@ impl eframe::App for LauncherApp {
                 if self.frame_count <= 1 {
                     trace("central: scroll done");
                 }
+                // 行循环里为了 &mut self 把 visible take 出来了，这里放回去
+                self.visible = visible_now;
             });
         if self.frame_count <= 1 {
             trace("update: central done");
@@ -1577,7 +1678,8 @@ impl eframe::App for LauncherApp {
             }
         }
 
-        if self.settings_draft.is_some() {
+        // 导入弹窗打开时把设置弹窗让出来：两层模态叠着太吵，关掉导入就回到设置
+        if self.settings_draft.is_some() && self.import_draft.is_none() {
             let mut draft = self.settings_draft.take().expect("checked is_some");
             match dialogs::draw_settings_dialog(ctx, &pal, &mut draft) {
                 SettingsOutcome::None => self.settings_draft = Some(draft),
@@ -1590,9 +1692,21 @@ impl eframe::App for LauncherApp {
                     }
                 },
                 SettingsOutcome::ImportHistory => {
-                    // 设置弹窗留着，导入结果用右下角 Toast 提示
+                    // 设置弹窗留着，在它上面再开一层「列出所有主机让你勾」的弹窗
                     self.settings_draft = Some(draft);
-                    self.import_history_with_toast(ctx);
+                    self.open_import_dialog(ctx);
+                }
+            }
+        }
+
+        // 导入弹窗：画在设置之上（后画的 Modal 拿到输入焦点）
+        if self.import_draft.is_some() {
+            let mut import = self.import_draft.take().expect("checked is_some");
+            match dialogs::draw_import_dialog(ctx, &pal, &mut import) {
+                ImportOutcome::None => self.import_draft = Some(import),
+                ImportOutcome::Cancel => {}
+                ImportOutcome::Import(entries) => {
+                    self.apply_import(entries, ctx);
                 }
             }
         }
@@ -1625,7 +1739,7 @@ impl eframe::App for LauncherApp {
         }
 
         // 探活还没收完就保持刷新节奏
-        if self.probe_rx.is_some() {
+        if self.probe.is_running() {
             ctx.request_repaint_after(std::time::Duration::from_millis(120));
         }
 
@@ -1637,6 +1751,9 @@ impl eframe::App for LauncherApp {
         // 隐藏到托盘时定时醒来排空托盘事件队列，防止某些环境下 repaint 没唤醒
         if self.hidden_to_tray {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        } else {
+            // 定时探活要按时醒来，否则用户不动鼠标就永远不刷新
+            self.schedule_probe_wakeup(ctx);
         }
 
         if self.scroll_to_cursor {
@@ -1660,7 +1777,7 @@ impl eframe::App for LauncherApp {
 impl LauncherApp {
     fn status_for(&self, host: &Host) -> ProbeStatus {
         if self.store.settings.probe {
-            probe::status_of(&self.statuses, &host.id)
+            self.probe.status(&host.id)
         } else {
             ProbeStatus::Disabled
         }
@@ -1677,7 +1794,10 @@ impl LauncherApp {
             RowAction::Select(pos) => self.cursor = pos,
             RowAction::Connect(pos) => {
                 self.cursor = pos;
-                self.connect_selected(ctx);
+                // 用行循环手里的那台下标（这期间 self.visible 被 take 出去了，不能靠它）
+                if let Some(&real) = visible.get(pos) {
+                    self.connect_host(real, ctx);
+                }
             }
             RowAction::Edit(pos) => {
                 self.cursor = pos;
@@ -1789,15 +1909,51 @@ mod tests {
     }
 
     #[test]
-    fn tray_menu_lists_hosts_directly_then_open_and_quit() {
-        let store = StoreData::seed();
+    fn tray_menu_lists_at_most_three_recent_hosts_then_open_and_quit() {
+        let mut store = StoreData::seed();
+        // 再加两台，凑够 4 台：托盘只该出现 3 台
+        store.hosts.push(Host {
+            id: "seed-demo-3".into(),
+            name: "第三台".into(),
+            host: "192.168.1.30".into(),
+            port: DEFAULT_PORT,
+            order: 2,
+            ..Default::default()
+        });
+        store.hosts.push(Host {
+            id: "seed-demo-4".into(),
+            name: "第四台".into(),
+            host: "192.168.1.40".into(),
+            port: DEFAULT_PORT,
+            order: 3,
+            ..Default::default()
+        });
+        store.normalize();
+
         let menu = build_tray_menu(&store);
         let items = menu.items();
-        // 2 台主机 + 分隔线 + 打开 + 退出
-        assert_eq!(items.len(), 5);
-        assert_eq!(items[0].id().0, "host:seed-demo-1");
-        assert_eq!(items[1].id().0, "host:seed-demo-2");
-        assert_eq!(items[3].id().0, "open");
-        assert_eq!(items[4].id().0, "quit");
+        // 标题 + 3 台主机 + 分隔线 + 打开 + 退出
+        assert_eq!(items.len(), 7);
+        assert_eq!(items[0].id().0, "recent-header");
+        assert_eq!(items[5].id().0, "open");
+        assert_eq!(items[6].id().0, "quit");
+        let host_ids: Vec<String> = items[1..4].iter().map(|i| i.id().0.clone()).collect();
+        assert_eq!(host_ids.len(), 3, "只列最近三台");
+
+        // 连过第四台之后，它要排到最前
+        store.touch_recent("seed-demo-4");
+        let menu = build_tray_menu(&store);
+        let items = menu.items();
+        assert_eq!(items[1].id().0, "host:seed-demo-4");
+    }
+
+    #[test]
+    fn tray_menu_without_hosts_shows_a_hint() {
+        let store = StoreData::default();
+        let menu = build_tray_menu(&store);
+        let items = menu.items();
+        assert_eq!(items[0].id().0, "hosts-empty");
+        assert_eq!(items[2].id().0, "open");
+        assert_eq!(items[3].id().0, "quit");
     }
 }

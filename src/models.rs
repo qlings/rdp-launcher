@@ -8,12 +8,22 @@ use std::collections::BTreeSet;
 
 pub const DEFAULT_PORT: u16 = 3389;
 
+/// 托盘右键「快速连接」最多列几台最近主机：只放最常用的，不把几十台全铺开。
+pub const QUICK_CONNECT_LIMIT: usize = 3;
+
+/// 设置里可选的探活自动刷新间隔（秒），0 = 只在启动 / 手动点时测。
+pub const PROBE_INTERVALS: [u64; 4] = [30, 60, 300, 0];
+
 fn default_port() -> u16 {
     DEFAULT_PORT
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_probe_interval() -> u64 {
+    60
 }
 
 pub fn new_id() -> String {
@@ -95,6 +105,9 @@ pub struct Settings {
     /// 启动后是否做 TCP 探活
     #[serde(default = "default_true")]
     pub probe: bool,
+    /// 探活自动刷新间隔（秒）；0 = 只在启动 / 手动点时测
+    #[serde(default = "default_probe_interval")]
+    pub probe_interval_secs: u64,
     /// 是否显示顶部快速搜索栏
     #[serde(default = "default_true")]
     pub show_search: bool,
@@ -118,6 +131,7 @@ impl Default for Settings {
         Self {
             sort: SortMode::Name,
             probe: true,
+            probe_interval_secs: default_probe_interval(),
             show_search: true,
             view: ViewMode::List,
             default_group: String::new(),
@@ -255,34 +269,86 @@ pub fn duplicate_into(hosts: &mut Vec<Host>, index: usize) -> Option<usize> {
     Some(index + 1)
 }
 
+/// 同地址同端口是否已经在列表里（地址大小写不敏感，忽略端口默认值差异由调用方处理）。
+pub fn address_exists(hosts: &[Host], host: &str, port: u16) -> bool {
+    hosts
+        .iter()
+        .any(|h| h.host.eq_ignore_ascii_case(host) && h.port == port)
+}
+
+/// 托盘右键「快速连接」要显示哪几台：最近连过的排前面，不够就按当前排序补齐。
+///
+/// 只返回还带地址的主机；`limit` 由 [`QUICK_CONNECT_LIMIT`] 决定。
+pub fn quick_host_indices(
+    hosts: &[Host],
+    recent: &[String],
+    sort: SortMode,
+    limit: usize,
+) -> Vec<usize> {
+    let mut picked: Vec<usize> = Vec::new();
+    for id in recent {
+        if picked.len() >= limit {
+            break;
+        }
+        if let Some(index) = hosts.iter().position(|h| &h.id == id) {
+            if hosts[index].host.trim().is_empty() || picked.contains(&index) {
+                continue;
+            }
+            picked.push(index);
+        }
+    }
+    if picked.len() < limit {
+        for index in visible_indices(hosts, "", None, sort) {
+            if picked.len() >= limit {
+                break;
+            }
+            if hosts[index].host.trim().is_empty() || picked.contains(&index) {
+                continue;
+            }
+            picked.push(index);
+        }
+    }
+    picked
+}
+
+/// 一次导入的结果：新建了哪些主机（id）、跳过了几条（已存在 / 地址非法）。
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ImportReport {
+    pub added: Vec<String>,
+    pub skipped: usize,
+}
+
+impl ImportReport {
+    pub fn added_count(&self) -> usize {
+        self.added.len()
+    }
+}
+
 /// 把历史记录导入成主机：同地址同端口的已经在列表里就跳过。
 ///
 /// 导入的主机按「剪贴板开、声音关、映射全部盘符」的默认值来，备注名留空
-/// （列表里直接显示地址），需要的话再逐台改。返回 `(导入数量, 跳过数量)`。
+/// （列表里直接显示地址），需要的话再逐台改。
 pub fn import_hosts(
     hosts: &mut Vec<Host>,
     entries: &[(String, u16, String)],
     drives: &[String],
-) -> (usize, usize) {
-    let mut added = 0;
-    let mut skipped = 0;
+) -> ImportReport {
+    let mut report = ImportReport::default();
     let mut order = hosts.iter().map(|h| h.order).max().unwrap_or(-1) + 1;
 
     for (host, port, username) in entries {
         let host = clean_host(host);
         if validate_host(&host).is_err() || *port == 0 {
-            skipped += 1;
+            report.skipped += 1;
             continue;
         }
-        if hosts
-            .iter()
-            .any(|h| h.host.eq_ignore_ascii_case(&host) && h.port == *port)
-        {
-            skipped += 1;
+        if address_exists(hosts, &host, *port) {
+            report.skipped += 1;
             continue;
         }
+        let id = new_id();
         hosts.push(Host {
-            id: new_id(),
+            id: id.clone(),
             name: String::new(),
             host,
             port: *port,
@@ -295,9 +361,9 @@ pub fn import_hosts(
             order,
         });
         order += 1;
-        added += 1;
+        report.added.push(id);
     }
-    (added, skipped)
+    report
 }
 
 pub fn format_authority(host: &str, port: u16) -> String {
@@ -748,9 +814,10 @@ mod tests {
             (String::new(), 3389, String::new()),
         ];
         let drives = vec!["C".to_string(), "D".to_string()];
-        let (added, skipped) = import_hosts(&mut hosts, &entries, &drives);
-        assert_eq!((added, skipped), (1, 3));
+        let report = import_hosts(&mut hosts, &entries, &drives);
+        assert_eq!((report.added_count(), report.skipped), (1, 3));
         assert_eq!(hosts.len(), 2);
+        assert_eq!(report.added, vec![hosts[1].id.clone()]);
 
         let imported = &hosts[1];
         assert_eq!(imported.host, "10.0.0.2");
@@ -764,11 +831,54 @@ mod tests {
     }
 
     #[test]
+    fn quick_connect_prefers_recent_then_falls_back_to_sort_order() {
+        let hosts = vec![
+            host("甲", "10.0.0.1", &[], 0),
+            host("乙", "10.0.0.2", &[], 1),
+            host("丙", "10.0.0.3", &[], 2),
+            host("丁", "10.0.0.4", &[], 3),
+        ];
+        // 没有任何连接记录：按名称排序取前三台（用的 host() 名字是 甲乙丙丁）
+        let picked = quick_host_indices(&hosts, &[], SortMode::Name, QUICK_CONNECT_LIMIT);
+        assert_eq!(picked.len(), 3);
+        assert_eq!(hosts[picked[0]].name, "丁");
+
+        // 最近连过「甲」：排最前，后面补齐，总共还是 3 台
+        let recent = vec![hosts[0].id.clone()];
+        let picked = quick_host_indices(&hosts, &recent, SortMode::Name, QUICK_CONNECT_LIMIT);
+        assert_eq!(picked.len(), 3);
+        assert_eq!(hosts[picked[0]].name, "甲");
+
+        // 最近列表里有已删掉 / 重复的 id，不会占位也不会重复出现
+        let recent = vec![
+            "gone".to_string(),
+            hosts[1].id.clone(),
+            hosts[1].id.clone(),
+        ];
+        let picked = quick_host_indices(&hosts, &recent, SortMode::Name, QUICK_CONNECT_LIMIT);
+        assert_eq!(picked.len(), 3);
+        assert_eq!(hosts[picked[0]].name, "乙");
+
+        // 没有地址的主机不占快速连接的位置
+        let mut with_blank = hosts.clone();
+        with_blank[0].host.clear();
+        let picked = quick_host_indices(
+            &with_blank,
+            &[with_blank[0].id.clone()],
+            SortMode::Name,
+            QUICK_CONNECT_LIMIT,
+        );
+        assert!(!picked.contains(&0));
+        assert_eq!(picked.len(), 3);
+    }
+
+    #[test]
     fn settings_defaults_keep_background_mode_off() {
         let settings = Settings::default();
         assert!(!settings.close_to_tray);
         assert!(settings.rdp_warning_hint);
         assert!(settings.probe);
+        assert_eq!(settings.probe_interval_secs, 60);
         assert!(settings.show_search);
     }
 }

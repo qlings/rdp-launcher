@@ -195,6 +195,11 @@ impl Store {
             self.settings.default_group.clear();
         }
 
+        // 探活间隔只认设置里给的几档，手改过的配置文件不至于变成每 3 秒扫一次
+        if !models::PROBE_INTERVALS.contains(&self.settings.probe_interval_secs) {
+            self.settings.probe_interval_secs = 60;
+        }
+
         // 最近主机：只留还存在的，去重，最多 8 条
         let host_ids: HashSet<String> = self.hosts.iter().map(|h| h.id.clone()).collect();
         let mut seen_recent = HashSet::new();
@@ -852,8 +857,7 @@ mod tests {
     }
 
     #[test]
-    fn normalize_repairs_hosts_and_default_group() {
-        let mut store = Store::default();
+    fn normalize_repairs_hosts_and_default_group() {        let mut store = Store::default();
         store.settings.default_group = "不存在".into();
         store.hosts.push(Host {
             id: String::new(),
@@ -871,6 +875,22 @@ mod tests {
         assert_eq!(store.hosts[0].drives, vec!["C".to_string()]);
         assert!(store.groups.iter().any(|g| g.name == "甲"));
         assert!(!store.hosts[0].id.is_empty());
+    }
+
+    #[test]
+    fn normalize_keeps_only_allowed_probe_intervals() {
+        let mut store = Store::default();
+        store.settings.probe_interval_secs = 7;
+        store.normalize();
+        assert_eq!(store.settings.probe_interval_secs, 60, "乱写的间隔回到默认 1 分钟");
+
+        store.settings.probe_interval_secs = 0;
+        store.normalize();
+        assert_eq!(store.settings.probe_interval_secs, 0, "「不自动」要保留");
+
+        store.settings.probe_interval_secs = 300;
+        store.normalize();
+        assert_eq!(store.settings.probe_interval_secs, 300);
     }
 
     #[test]

@@ -11,10 +11,11 @@ use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 use crate::drives::DriveInfo;
+use crate::history::HistoryEntry;
 use crate::models::{self, Group, Host, Settings, SortMode, ViewMode};
 use crate::rdp_warning;
 use crate::store::Store;
-use crate::ui::{chip, segmented, Palette};
+use crate::ui::{chip, chip_disabled, segmented, Palette};
 
 // ---------------------------------------------------------------------------
 // 主机编辑
@@ -833,8 +834,8 @@ pub fn draw_settings_dialog(
                     section_title(ui, pal, "导入主机");
                     ui.label(
                         RichText::new(
-                            "把本机 Windows 远程桌面（mstsc）连过的机器一次导入成主机；\
-                             同地址同端口的会跳过，不会重复。",
+                            "把本机 Windows 远程桌面（mstsc）连过的机器导入成主机：\
+                             点下面的按钮会先列出所有找到的主机，勾选要哪些再确认。",
                         )
                         .size(11.0)
                         .color(pal.text_dim),
@@ -842,7 +843,7 @@ pub fn draw_settings_dialog(
                     if ui
                         .add(
                             egui::Button::new(
-                                RichText::new("导入本机远程桌面历史")
+                                RichText::new("导入本机远程桌面历史…")
                                     .size(12.0)
                                     .color(Color32::WHITE),
                             )
@@ -850,15 +851,18 @@ pub fn draw_settings_dialog(
                             .corner_radius(CornerRadius::same(7))
                             .min_size(Vec2::new(0.0, 31.0)),
                         )
-                        .on_hover_text("读 HKCU 下 mstsc 的最近连接记录，不改动 Windows 自身设置")
+                        .on_hover_text("读 HKCU 下 mstsc 的最近连接记录，列出机器供勾选，不改动 Windows 自身设置")
                         .clicked()
                     {
                         outcome = SettingsOutcome::ImportHistory;
                     }
                     ui.label(
-                        RichText::new("导入的主机默认带剪贴板、不带声音、映射本机全部盘符，进来后可以逐台改。")
-                            .size(11.0)
-                            .color(pal.text_dim),
+                        RichText::new(
+                            "能导入的默认全选；已经在列表里的会标灰跳过。\
+                             导入的主机默认带剪贴板、不带声音、映射本机全部盘符，进来后可以逐台改。",
+                        )
+                        .size(11.0)
+                        .color(pal.text_dim),
                     );
 
                     ui.add_space(12.0);
@@ -959,10 +963,35 @@ pub fn draw_settings_dialog(
                             draft.settings.close_to_tray = !draft.settings.close_to_tray;
                         }
                     });
+                    if draft.settings.probe {
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("自动刷新").size(12.0).color(pal.text_dim));
+                            segmented(
+                                ui,
+                                pal,
+                                &mut draft.settings.probe_interval_secs,
+                                &[
+                                    (30u64, "30 秒"),
+                                    (60u64, "1 分钟"),
+                                    (300u64, "5 分钟"),
+                                    (0u64, "不自动"),
+                                ],
+                            );
+                        });
+                        ui.label(
+                            RichText::new(
+                                "启动时先测一轮；之后按这个间隔在后台重新检测，变化会自己更新。\
+                                 顶部「● 在线 x/y」点一下可以立刻重测，隐藏到托盘时不刷新。",
+                            )
+                            .size(11.0)
+                            .color(pal.text_dim),
+                        );
+                    }
                     if draft.settings.close_to_tray {
                         ui.label(
                             RichText::new(
-                                "开启后关闭窗口不会退出：右键任务栏通知区域的小图标 → 直接连主机 / 打开主界面 / 退出。",
+                                "开启后关闭窗口不会退出：右键任务栏通知区域的小图标 → 最近连接 / 打开主界面 / 退出。",
                             )
                             .size(11.0)
                             .color(pal.text_dim),
@@ -1277,6 +1306,296 @@ pub fn draw_settings_dialog(
 }
 
 // ---------------------------------------------------------------------------
+// 导入本机远程桌面历史（多选）
+// ---------------------------------------------------------------------------
+
+/// 一条待导入的历史 + 勾选状态。
+pub struct ImportItem {
+    pub entry: HistoryEntry,
+    pub selected: bool,
+    /// 同地址同端口已经在主机列表里：默认不勾、也不能勾（勾了也导不进来）。
+    pub existing: bool,
+}
+
+impl ImportItem {
+    pub fn label(&self) -> String {
+        models::format_authority(&self.entry.host, self.entry.port)
+    }
+}
+
+/// 「导入本机远程桌面历史」弹窗的草稿：先把找到的机器全列出来，让人勾。
+pub struct ImportDraft {
+    pub items: Vec<ImportItem>,
+}
+
+impl ImportDraft {
+    /// 真正读注册表：设置 / 空状态里点「导入」时调用。
+    pub fn from_local(store: &Store) -> Self {
+        Self::from_entries(crate::history::local_history(), &store.hosts)
+    }
+
+    /// 纯函数版本（方便单测）：标记已存在的主机，能导入的默认全选。
+    pub fn from_entries(entries: Vec<HistoryEntry>, hosts: &[Host]) -> Self {
+        let items = entries
+            .into_iter()
+            .map(|entry| {
+                let existing = models::address_exists(hosts, &entry.host, entry.port);
+                ImportItem {
+                    selected: !existing,
+                    existing,
+                    entry,
+                }
+            })
+            .collect();
+        Self { items }
+    }
+
+    /// 能不能导入（历史里没有、也不在现有列表里）。
+    pub fn importable(&self) -> usize {
+        self.items.iter().filter(|item| !item.existing).count()
+    }
+
+    pub fn selected_count(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|item| item.selected && !item.existing)
+            .count()
+    }
+
+    pub fn all_selected(&self) -> bool {
+        self.importable() > 0 && self.selected_count() == self.importable()
+    }
+
+    pub fn set_all(&mut self, on: bool) {
+        for item in &mut self.items {
+            if !item.existing {
+                item.selected = on;
+            }
+        }
+    }
+
+    pub fn selected_entries(&self) -> Vec<(String, u16, String)> {
+        self.items
+            .iter()
+            .filter(|item| item.selected && !item.existing)
+            .map(|item| {
+                (
+                    item.entry.host.clone(),
+                    item.entry.port,
+                    item.entry.username.clone(),
+                )
+            })
+            .collect()
+    }
+}
+
+pub enum ImportOutcome {
+    None,
+    Cancel,
+    /// 确认导入这些主机（已按勾选过滤好的）。
+    Import(Vec<(String, u16, String)>),
+}
+
+/// 导入弹窗：列出所有能导入的主机，多选，默认全选。
+pub fn draw_import_dialog(
+    ctx: &egui::Context,
+    pal: &Palette,
+    draft: &mut ImportDraft,
+) -> ImportOutcome {
+    let mut outcome = ImportOutcome::None;
+
+    egui::Modal::new(egui::Id::new("import_dialog"))
+        .frame(
+            Frame::new()
+                .fill(pal.panel)
+                .stroke(Stroke::new(1.0_f32, pal.border))
+                .corner_radius(CornerRadius::same(14))
+                .inner_margin(Margin::same(20)),
+        )
+        .backdrop_color(Color32::from_black_alpha(110))
+        .show(ctx, |ui| {
+            let width = (ctx.screen_rect().width() - 56.0).clamp(340.0, 540.0);
+            ui.set_width(width);
+            ui.label(
+                RichText::new("导入本机远程桌面历史")
+                    .size(18.0)
+                    .strong()
+                    .color(pal.text),
+            );
+
+            if draft.items.is_empty() {
+                ui.label(
+                    RichText::new(
+                        "没有找到本机的远程桌面历史。\n\
+                         在 mstsc 里连过机器之后才会留下记录，也可以直接「+ 新增主机」。",
+                    )
+                    .size(12.5)
+                    .color(pal.text_dim),
+                );
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("关闭").size(13.0).color(Color32::WHITE),
+                                )
+                                .fill(pal.accent)
+                                .corner_radius(CornerRadius::same(9))
+                                .min_size(Vec2::new(84.0, 34.0)),
+                            )
+                            .clicked()
+                        {
+                            outcome = ImportOutcome::Cancel;
+                        }
+                    });
+                });
+                return;
+            }
+
+            let existing = draft.items.iter().filter(|item| item.existing).count();
+            let mut subtitle = format!(
+                "找到 {} 台，可导入 {} 台。勾选要导入的机器，默认全选。",
+                draft.items.len(),
+                draft.importable()
+            );
+            if existing > 0 {
+                subtitle.push_str(&format!("（{existing} 台已在列表里，灰色不可选）"));
+            }
+            ui.label(RichText::new(subtitle).size(11.5).color(pal.text_dim));
+            ui.add_space(6.0);
+
+            ui.horizontal(|ui| {
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new("全选").size(11.5).color(pal.accent))
+                            .fill(Color32::TRANSPARENT)
+                            .stroke(Stroke::NONE)
+                            .min_size(Vec2::new(0.0, 24.0)),
+                    )
+                    .clicked()
+                {
+                    draft.set_all(true);
+                }
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new("全不选").size(11.5).color(pal.text_dim))
+                            .fill(Color32::TRANSPARENT)
+                            .stroke(Stroke::NONE)
+                            .min_size(Vec2::new(0.0, 24.0)),
+                    )
+                    .clicked()
+                {
+                    draft.set_all(false);
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let suffix = if draft.all_selected() { "（全部）" } else { "" };
+                    ui.label(
+                        RichText::new(format!(
+                            "已选 {}/{}{suffix}",
+                            draft.selected_count(),
+                            draft.importable()
+                        ))
+                        .size(11.0)
+                        .color(pal.text_dim),
+                    );
+                });
+            });
+
+            ui.add_space(4.0);
+            // 主机少的时候弹窗跟着变矮，多了才滚动
+            let body_h = (ctx.screen_rect().height() - 250.0).max(120.0);
+            egui::ScrollArea::vertical()
+                .max_height(body_h)
+                .scroll_bar_visibility(
+                    egui::containers::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
+                )
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for item in &mut draft.items {
+                        ui.horizontal(|ui| {
+                            let label = item.label();
+                            if item.existing {
+                                chip_disabled(ui, pal, &label);
+                                ui.label(
+                                    RichText::new("已在列表")
+                                        .size(11.0)
+                                        .color(pal.text_dim),
+                                );
+                            } else {
+                                if chip(ui, pal, item.selected, &label, 0.0).clicked() {
+                                    item.selected = !item.selected;
+                                }
+                                if !item.entry.username.trim().is_empty() {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "账号 {}",
+                                            item.entry.username.trim()
+                                        ))
+                                        .size(11.0)
+                                        .color(pal.text_dim),
+                                    );
+                                }
+                            }
+                        });
+                    }
+                });
+
+            ui.add_space(12.0);
+            ui.label(
+                RichText::new(
+                    "导入的主机默认带剪贴板、不带声音、映射本机全部盘符，账号从历史里带过来，\
+                     密码需要自己填。",
+                )
+                .size(11.0)
+                .color(pal.text_dim),
+            );
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let count = draft.selected_count();
+                    let can_import = count > 0;
+                    let import_btn = egui::Button::new(
+                        RichText::new(format!("导入 {count} 台"))
+                            .size(13.0)
+                            .color(Color32::WHITE),
+                    )
+                    .fill(if can_import { pal.accent } else { pal.checking })
+                    .corner_radius(CornerRadius::same(9))
+                    .min_size(Vec2::new(96.0, 34.0));
+                    if ui
+                        .add_enabled(can_import, import_btn)
+                        .on_hover_text(if can_import {
+                            "把这些主机加进列表"
+                        } else {
+                            "先勾选至少一台"
+                        })
+                        .clicked()
+                    {
+                        outcome = ImportOutcome::Import(draft.selected_entries());
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("取消").size(13.0).color(pal.text_dim),
+                            )
+                            .fill(pal.panel)
+                            .stroke(Stroke::new(1.0_f32, pal.border))
+                            .corner_radius(CornerRadius::same(9))
+                            .min_size(Vec2::new(76.0, 34.0)),
+                        )
+                        .clicked()
+                    {
+                        outcome = ImportOutcome::Cancel;
+                    }
+                });
+            });
+        });
+
+    outcome
+}
+
+// ---------------------------------------------------------------------------
 // 关于
 // ---------------------------------------------------------------------------
 
@@ -1361,8 +1680,9 @@ pub fn draw_about_dialog(
             for line in [
                 "单文件绿色版：主机、密码、分组、设置都加密存在 exe 里，不生成 json。",
                 "支持多分组、端口单独配置、磁盘 / 声音 / 剪贴板映射、序号排序。",
-                "支持从本机远程桌面历史一键导入主机。",
-                "支持列表 / 方块显示、关闭后保持后台、托盘右键快速连接。",
+                "本机远程桌面历史一键导入：先列出找到的主机，勾选要哪些再导入。",
+                "在线状态启动时测一次，之后按设置的间隔自动刷新，也能点顶部胶囊 / F5 立刻重测。",
+                "列表 / 方块显示、关闭后保持后台、托盘右键只列最近三台常用主机。",
                 "内置 Windows 2026 RDP 安全警告的关闭开关。",
             ] {
                 ui.label(RichText::new(line).size(11.5).color(pal.text_dim));
@@ -1751,6 +2071,106 @@ mod tests {
         draft.groups[1].name = "公司".into();
         let mut target = store.clone();
         assert!(draft.apply(&mut target).is_err());
+    }
+
+    fn history(host: &str, port: u16, username: &str) -> HistoryEntry {
+        HistoryEntry {
+            host: host.into(),
+            port,
+            username: username.into(),
+        }
+    }
+
+    #[test]
+    fn import_draft_defaults_to_all_importable_and_marks_existing() {
+        let mut store = Store::default();
+        store.hosts = vec![Host {
+            id: "a".into(),
+            host: "10.0.0.1".into(),
+            port: 3389,
+            ..Default::default()
+        }];
+        let draft = ImportDraft::from_entries(
+            vec![
+                history("10.0.0.1", 3389, ""),
+                history("10.0.0.2", 3390, "ql"),
+                history("10.0.0.3", 3389, ""),
+            ],
+            &store.hosts,
+        );
+        assert_eq!(draft.items.len(), 3);
+        assert!(draft.items[0].existing, "已经在列表里的要标出来");
+        assert!(!draft.items[0].selected);
+        assert_eq!(draft.importable(), 2);
+        assert_eq!(draft.selected_count(), 2, "能导入的默认全选");
+        assert!(draft.all_selected());
+        assert_eq!(
+            draft.selected_entries(),
+            vec![
+                ("10.0.0.2".to_string(), 3390, "ql".to_string()),
+                ("10.0.0.3".to_string(), 3389, String::new()),
+            ]
+        );
+        // 显示用的地址带端口，IPv6 加方括号
+        assert_eq!(draft.items[0].label(), "10.0.0.1:3389");
+    }
+
+    #[test]
+    fn import_draft_can_clear_and_reselect_but_skips_existing() {
+        let existing = Host {
+            id: "a".into(),
+            host: "10.0.0.1".into(),
+            port: 3389,
+            ..Default::default()
+        };
+        let mut draft = ImportDraft::from_entries(
+            vec![history("10.0.0.1", 3389, ""), history("10.0.0.2", 3389, "")],
+            std::slice::from_ref(&existing),
+        );
+        draft.set_all(false);
+        assert_eq!(draft.selected_count(), 0);
+        assert!(!draft.all_selected());
+        assert!(draft.selected_entries().is_empty());
+
+        draft.set_all(true);
+        assert_eq!(draft.selected_count(), 1);
+        assert!(draft.all_selected());
+    }
+
+    #[test]
+    fn import_draft_with_only_existing_hosts_has_nothing_to_import() {
+        let existing = Host {
+            id: "a".into(),
+            host: "10.0.0.1".into(),
+            port: 3389,
+            ..Default::default()
+        };
+        let mut draft =
+            ImportDraft::from_entries(vec![history("10.0.0.1", 3389, "")], &[existing]);
+        assert_eq!(draft.importable(), 0);
+        assert_eq!(draft.selected_count(), 0);
+        assert!(!draft.all_selected(), "没有可导入的就不算全选");
+        draft.set_all(true);
+        assert_eq!(draft.selected_count(), 0, "已存在的主机勾不上");
+    }
+
+    /// 不开窗口跑一帧，确认导入弹窗（含空列表分支）画得出来、不会 panic。
+    #[test]
+    fn import_dialog_renders_in_a_headless_context() {
+        let pal = crate::ui::palette(false);
+        for entries in [
+            vec![
+                history("10.0.0.2", 3390, "ql"),
+                history("10.0.0.1", 3389, ""),
+            ],
+            Vec::new(),
+        ] {
+            let mut draft = ImportDraft::from_entries(entries, &[]);
+            let ctx = egui::Context::default();
+            let _ = ctx.run(Default::default(), |ctx| {
+                let _ = draw_import_dialog(ctx, &pal, &mut draft);
+            });
+        }
     }
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "rdp-launcher"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.81"
 description = "极速轻量级 RDP 远程桌面悬浮启动器"

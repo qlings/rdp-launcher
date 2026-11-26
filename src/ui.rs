@@ -95,6 +95,20 @@ pub struct TopBarOutput {
     pub toggle_theme: bool,
     /// 这一帧搜索词变了：列表要重算过滤 + 排序
     pub search_changed: bool,
+    /// 点了「在线 x/y」小胶囊：立刻重新检测一轮
+    pub refresh_probe: bool,
+}
+
+/// 顶部那颗「在线 x/y」胶囊要显示什么。
+#[derive(Clone, Copy, Default)]
+pub struct ProbeSummary {
+    pub enabled: bool,
+    pub online: usize,
+    pub total: usize,
+    /// 正在检测（有批次在跑）
+    pub checking: bool,
+    /// 距离上次检测结束过了多久（从没测过是 None）
+    pub since_last: Option<std::time::Duration>,
 }
 
 pub fn draw_top_bar(
@@ -104,12 +118,14 @@ pub fn draw_top_bar(
     show_search: bool,
     want_focus_search: &mut bool,
     dark: bool,
+    probe: ProbeSummary,
 ) -> TopBarOutput {
     let mut out = TopBarOutput {
         open_add: false,
         open_settings: false,
         toggle_theme: false,
         search_changed: false,
+        refresh_probe: false,
     };
 
     ui.horizontal(|ui| {
@@ -167,6 +183,47 @@ pub fn draw_top_bar(
             .min_size(Vec2::new(104.0, 38.0));
             if ui.add(add_btn).clicked() {
                 out.open_add = true;
+            }
+
+            // 在线统计 + 手动刷新二合一：点一下就重新检测，比在设置里找开关快。
+            let (label, color) = if !probe.enabled {
+                ("探活已关".to_string(), pal.text_dim)
+            } else if probe.checking {
+                ("● 检测中".to_string(), pal.checking)
+            } else {
+                let color = if probe.online > 0 {
+                    pal.online
+                } else if probe.total > 0 {
+                    pal.offline
+                } else {
+                    pal.text_dim
+                };
+                (format!("● {}/{}", probe.online, probe.total), color)
+            };
+            let probe_btn = egui::Button::new(RichText::new(label).size(12.5).color(color))
+                .fill(pal.panel)
+                .stroke(Stroke::new(1.0_f32, pal.border))
+                .corner_radius(CornerRadius::same(9))
+                .min_size(Vec2::new(0.0, 38.0));
+            if ui
+                .add(probe_btn)
+                .on_hover_text(if probe.enabled {
+                    let when = match probe.since_last {
+                        Some(elapsed) if elapsed.as_secs() < 5 => "刚刚检测".to_string(),
+                        Some(elapsed) if elapsed.as_secs() < 60 => {
+                            format!("{} 秒前检测", elapsed.as_secs())
+                        }
+                        Some(elapsed) => format!("{} 分钟前检测", elapsed.as_secs() / 60),
+                        None => "还没检测".to_string(),
+                    };
+                    format!("在线 {} / 共 {} 台 · {when} · 点一下重新检测（F5）", probe.online, probe.total)
+                } else {
+                    "探活已在设置里关闭 · 点一下去设置里开启".to_string()
+                })
+                .on_hover_cursor(CursorIcon::PointingHand)
+                .clicked()
+            {
+                out.refresh_probe = true;
             }
         });
     });
@@ -316,7 +373,7 @@ fn is_host_double_click(ui: &egui::Ui, host_id: &str) -> bool {
     double
 }
 
-/// 带明显方框和勾的开关胶囊。用于分组、盘符、剪贴板、声音。
+/// 带明显方框和勾的开关胶囊。用于分组、盘符、剪贴板、声音、导入勾选。
 pub fn chip(
     ui: &mut egui::Ui,
     pal: &Palette,
@@ -324,22 +381,47 @@ pub fn chip(
     label: &str,
     min_width: f32,
 ) -> egui::Response {
+    chip_core(ui, pal, selected, label, min_width, true)
+}
+
+/// 不可勾选的胶囊：导入列表里「已经在主机列表里」的那些，看得见但点不动。
+pub fn chip_disabled(ui: &mut egui::Ui, pal: &Palette, label: &str) -> egui::Response {
+    chip_core(ui, pal, false, label, 0.0, false)
+}
+
+fn chip_core(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    selected: bool,
+    label: &str,
+    min_width: f32,
+    enabled: bool,
+) -> egui::Response {
     let font = FontId::proportional(12.5);
-    let text_color = if selected { Color32::WHITE } else { pal.text };
+    let text_color = if !enabled {
+        pal.text_dim
+    } else if selected {
+        Color32::WHITE
+    } else {
+        pal.text
+    };
     let galley = ui
         .painter()
         .layout_no_wrap(label.to_string(), font, text_color);
     let width = (galley.size().x + 46.0).max(min_width);
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 31.0), Sense::click());
+    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 31.0), sense);
 
-    let fill = if selected {
+    let fill = if !enabled {
+        pal.input_bg
+    } else if selected {
         pal.accent
     } else if response.hovered() {
         pal.card_hover
     } else {
         pal.panel
     };
-    let stroke = if selected {
+    let stroke = if selected && enabled {
         Stroke::new(1.0_f32, pal.accent)
     } else {
         Stroke::new(1.0_f32, pal.border)
@@ -351,7 +433,7 @@ pub fn chip(
         Pos2::new(rect.left() + 9.0, rect.center().y - 7.0),
         Vec2::splat(14.0),
     );
-    if selected {
+    if selected && enabled {
         painter.rect_filled(box_rect, CornerRadius::same(4), Color32::WHITE);
         let c = box_rect.center();
         painter.line_segment(
@@ -370,7 +452,7 @@ pub fn chip(
             box_rect,
             CornerRadius::same(4),
             pal.input_bg,
-            Stroke::new(1.6_f32, pal.text_dim),
+            Stroke::new(1.6_f32, if enabled { pal.text_dim } else { pal.border }),
             StrokeKind::Inside,
         );
     }
@@ -384,7 +466,11 @@ pub fn chip(
         text_color,
     );
 
-    response.on_hover_cursor(CursorIcon::PointingHand)
+    if enabled {
+        response.on_hover_cursor(CursorIcon::PointingHand)
+    } else {
+        response
+    }
 }
 
 /// 分段选择器（排序方式 / 显示方式 / 主题）。
@@ -483,6 +569,20 @@ pub fn draw_host_row(
     if status == ProbeStatus::Online {
         ui.painter()
             .circle_filled(dot, 9.0, dot_color.gamma_multiply(0.18));
+    }
+    // 圆点太小、又没有文字，鼠标停在上面时把状态说清楚。
+    // 用 show_tooltip_at_pointer 而不是再加一个可交互矩形：后者会把整行的点击抢走。
+    if let Some(pos) = ui.ctx().pointer_hover_pos() {
+        if Rect::from_center_size(dot, Vec2::splat(24.0)).contains(pos) {
+            egui::show_tooltip_at_pointer(
+                ui.ctx(),
+                ui.layer_id(),
+                ui.id().with(("status-tip", index)),
+                |ui| {
+                    ui.label(status_hint(status));
+                },
+            );
+        }
     }
 
     // 右侧按钮：只留「连接」「编辑」
@@ -842,6 +942,15 @@ fn status_color(status: ProbeStatus, pal: &Palette) -> Color32 {
     }
 }
 
+fn status_hint(status: ProbeStatus) -> &'static str {
+    match status {
+        ProbeStatus::Online => "在线：远程桌面端口能连上",
+        ProbeStatus::Offline => "离线：端口连不上（点「连接」仍可尝试）",
+        ProbeStatus::Checking => "正在检测…",
+        ProbeStatus::Disabled => "探测已关闭（设置 → 启动行为 → 探测可用性）",
+    }
+}
+
 fn badge_width(painter: &egui::Painter, text: &str) -> f32 {
     painter
         .layout_no_wrap(
@@ -912,7 +1021,7 @@ pub fn draw_footer(
     let mut about_clicked = false;
     ui.horizontal(|ui| {
         ui.add_space(2.0);
-        let hint = RichText::new("↑/↓ 选择   ·   Enter 连接   ·   双击直接连   ·   Esc 清空搜索")
+        let hint = RichText::new("↑/↓ 选择   ·   Enter 连接   ·   双击直连   ·   F5 重新检测")
             .size(11.5)
             .color(pal.text_dim);
         ui.label(hint);

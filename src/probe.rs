@@ -1,13 +1,20 @@
 //! 后台 TCP 端口探活。
 //!
-//! 冷启动不等探活：UI 先画出来，检测结果回来再 `request_repaint()` 更新圆点。
-//! 有限线程池，最大并发 32，超时 800ms。设置里关掉探活时主程序根本不会调这里。
+//! 设计（v0.6.0）：
+//!
+//! * 冷启动不等探活：窗口先画出来，结果回来再 `request_repaint()` 更新圆点。
+//! * **启动测一次，之后定时刷新**（间隔来自 `settings.probe_interval_secs`，0 = 不自动），
+//!   顶部「● 在线 x/y」点一下也能立刻重测。以前只在启动时测一次，机器开久了
+//!   圆点就是半年前的结论。
+//! * **同一地址 + 端口只连一次**：复制出来的副本和原主机共用一份结果，
+//!   结果按 id 扇出（以前每台主机各扫一遍，副本越多越慢）。
+//! * **结果按 id 缓存**：刷新时旧结果先留着，新结果回来再覆盖，圆点不会整排变灰。
+//! * 有限线程池，最大并发 32，单次连接超时 800ms，单批 2.5 秒截止。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
+use std::time::{Duration, Instant};
 
 use crate::models::Host;
 
@@ -63,6 +70,21 @@ pub fn targets_of(hosts: &[Host]) -> Vec<Target> {
     hosts.iter().filter_map(Target::from_host).collect()
 }
 
+/// 只探测指定 id 的主机（新增 / 改地址 / 导入之后用，不用全量重扫）。
+pub fn targets_for(hosts: &[Host], ids: &[String]) -> Vec<Target> {
+    let wanted: HashSet<&str> = ids.iter().map(String::as_str).collect();
+    hosts
+        .iter()
+        .filter(|h| wanted.contains(h.id.as_str()))
+        .filter_map(Target::from_host)
+        .collect()
+}
+
+/// 去重键：地址大小写不敏感，端口参与。
+fn dedupe_key(host: &str, port: u16) -> String {
+    format!("{}\u{1}{port}", host.trim().to_ascii_lowercase())
+}
+
 fn probe_one(task: &Target) -> bool {
     // 域名可能解析出多个地址，任意一个连上就算在线。
     let Ok(addrs) = (task.host.as_str(), task.port).to_socket_addrs() else {
@@ -90,11 +112,11 @@ pub fn spawn_probe_batch(tasks: Vec<Target>, tx: Sender<(String, bool)>) {
     }
 
     let total = tasks.len();
-    let queue = Arc::new(Mutex::new(tasks));
+    let queue = std::sync::Arc::new(std::sync::Mutex::new(tasks));
     let worker_count = MAX_CONCURRENCY.min(total).max(1);
 
     for _ in 0..worker_count {
-        let queue = Arc::clone(&queue);
+        let queue = std::sync::Arc::clone(&queue);
         let tx = tx.clone();
         std::thread::spawn(move || loop {
             let task = {
@@ -122,6 +144,163 @@ pub fn status_of(map: &StatusMap, id: &str) -> ProbeStatus {
     map.get(id).copied().unwrap_or(ProbeStatus::Checking)
 }
 
+/// 一次进行中的探测批次。
+struct Run {
+    rx: Receiver<(String, bool)>,
+    deadline: Instant,
+    /// 去重键 -> 这一份结果要扇出给哪些主机 id
+    fanout: HashMap<String, Vec<String>>,
+}
+
+/// 探活控制器：主程序只跟它打交道，状态、进行中的批次、上次完成时间都在这里。
+///
+/// 允许同时有多批（例如定时刷新跑到一半时用户改了某台主机的地址），
+/// 各批结果互不覆盖，谁先回来谁先落。
+#[derive(Default)]
+pub struct ProbeRunner {
+    statuses: StatusMap,
+    runs: Vec<Run>,
+    last_finished: Option<Instant>,
+}
+
+impl ProbeRunner {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn status(&self, id: &str) -> ProbeStatus {
+        status_of(&self.statuses, id)
+    }
+
+    pub fn is_running(&self) -> bool {
+        !self.runs.is_empty()
+    }
+
+    /// 最近一次探测全部结束的时间；从没测过是 None。
+    pub fn last_finished(&self) -> Option<Instant> {
+        self.last_finished
+    }
+
+    pub fn online_count(&self) -> usize {
+        self.statuses
+            .values()
+            .filter(|s| **s == ProbeStatus::Online)
+            .count()
+    }
+
+    /// 清空所有结果（关掉探活、整批作废时用）。
+    pub fn clear(&mut self) {
+        self.statuses.clear();
+        self.runs.clear();
+        self.last_finished = None;
+    }
+
+    /// 丢掉某台主机的状态（删除主机时用）。
+    pub fn forget(&mut self, id: &str) {
+        self.statuses.remove(id);
+    }
+
+    /// 让某些主机回到「检测中」（地址变了之后，旧结论已经没意义）。
+    pub fn invalidate(&mut self, ids: &[String]) {
+        for id in ids {
+            self.statuses.remove(id);
+        }
+    }
+
+    /// 复制主机时沿用原主机的状态：地址端口一样，没必要重新扫。
+    pub fn copy_status(&mut self, from: &str, to: &str) {
+        if let Some(status) = self.statuses.get(from).copied() {
+            self.statuses.insert(to.to_string(), status);
+        }
+    }
+
+    /// 连接成功后立刻标在线，不用等下一轮探测。
+    pub fn mark_online(&mut self, id: &str) {
+        self.statuses.insert(id.to_string(), ProbeStatus::Online);
+    }
+
+    /// 丢掉已经不存在的主机 id，避免状态表越攒越大。
+    pub fn prune(&mut self, keep: &HashSet<String>) {
+        self.statuses.retain(|id, _| keep.contains(id));
+    }
+
+    /// 发一批探测。同一地址 + 端口只连一次，结果扇出给所有同地址的主机。
+    pub fn start(&mut self, targets: Vec<Target>) {
+        let mut fanout: HashMap<String, Vec<String>> = HashMap::new();
+        let mut unique: Vec<Target> = Vec::new();
+        for target in targets {
+            let key = dedupe_key(&target.host, target.port);
+            match fanout.get_mut(&key) {
+                Some(ids) => ids.push(target.id),
+                None => {
+                    fanout.insert(key.clone(), vec![target.id.clone()]);
+                    unique.push(Target {
+                        id: key,
+                        host: target.host,
+                        port: target.port,
+                    });
+                }
+            }
+        }
+        let (tx, rx) = channel();
+        spawn_probe_batch(unique, tx);
+        self.runs.push(Run {
+            rx,
+            deadline: Instant::now() + BATCH_DEADLINE,
+            fanout,
+        });
+    }
+
+    /// 收结果。返回 true 表示有变化（调用方要 request_repaint）。
+    pub fn poll(&mut self) -> bool {
+        let mut changed = false;
+        let mut index = 0;
+        while index < self.runs.len() {
+            let mut finished = false;
+            loop {
+                match self.runs[index].rx.try_recv() {
+                    Ok((key, online)) => {
+                        let status = if online {
+                            ProbeStatus::Online
+                        } else {
+                            ProbeStatus::Offline
+                        };
+                        if let Some(ids) = self.runs[index].fanout.get(&key) {
+                            for id in ids {
+                                self.statuses.insert(id.clone(), status);
+                            }
+                        }
+                        changed = true;
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        finished = true;
+                        break;
+                    }
+                }
+            }
+            // DNS 卡住时 worker 可能很久不返回：到点就收摊，没出结果的按离线算，
+            // 不然会一直「检测中」并且每 120ms 空转重绘。
+            if !finished && Instant::now() >= self.runs[index].deadline {
+                for ids in self.runs[index].fanout.values() {
+                    for id in ids {
+                        self.statuses.entry(id.clone()).or_insert(ProbeStatus::Offline);
+                    }
+                }
+                finished = true;
+                changed = true;
+            }
+            if finished {
+                self.runs.remove(index);
+                self.last_finished = Some(Instant::now());
+            } else {
+                index += 1;
+            }
+        }
+        changed
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,6 +313,16 @@ mod tests {
             host: h,
             port: p,
         }
+    }
+
+    /// 等一批探测结束（最多 5 秒）。
+    fn wait_for(runner: &mut ProbeRunner) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while runner.is_running() && Instant::now() < deadline {
+            runner.poll();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!runner.is_running(), "探测应该在 5 秒内结束");
     }
 
     #[test]
@@ -190,5 +379,76 @@ mod tests {
         assert!(first.is_ok());
         // 空地址那台被跳过，不会再有一条结果
         assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
+    }
+
+    #[test]
+    fn runner_fans_one_connection_out_to_all_copies() {
+        // 两台主机同地址同端口（复制出来的副本）：只连一次，两边都拿到结果
+        let mut runner = ProbeRunner::new();
+        let targets = vec![
+            target("a", "127.0.0.1:1"),
+            target("a2", "127.0.0.1:1"),
+            target("b", "127.0.0.1:2"),
+        ];
+        runner.start(targets);
+        wait_for(&mut runner);
+        assert_eq!(runner.status("a"), ProbeStatus::Offline);
+        assert_eq!(runner.status("a2"), ProbeStatus::Offline);
+        assert_eq!(runner.status("b"), ProbeStatus::Offline);
+        assert_eq!(runner.status("missing"), ProbeStatus::Checking);
+        assert!(runner.last_finished().is_some());
+    }
+
+    #[test]
+    fn runner_marks_online_listener_and_ignores_stale_ids() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut runner = ProbeRunner::new();
+        runner.start(vec![Target {
+            id: "live".into(),
+            host: "127.0.0.1".into(),
+            port,
+        }]);
+        wait_for(&mut runner);
+        assert_eq!(runner.status("live"), ProbeStatus::Online);
+        assert_eq!(runner.online_count(), 1);
+
+        runner.invalidate(&["live".to_string()]);
+        assert_eq!(runner.status("live"), ProbeStatus::Checking);
+        runner.mark_online("live");
+        assert_eq!(runner.status("live"), ProbeStatus::Online);
+        runner.forget("live");
+        assert_eq!(runner.status("live"), ProbeStatus::Checking);
+        drop(listener);
+    }
+
+    #[test]
+    fn concurrent_batches_do_not_block_each_other() {
+        let mut runner = ProbeRunner::new();
+        runner.start(vec![target("first", "127.0.0.1:1")]);
+        runner.start(vec![target("second", "127.0.0.1:2")]);
+        wait_for(&mut runner);
+        assert_eq!(runner.status("first"), ProbeStatus::Offline);
+        assert_eq!(runner.status("second"), ProbeStatus::Offline);
+    }
+
+    #[test]
+    fn targets_for_only_picks_requested_ids() {
+        let hosts = vec![
+            Host {
+                id: "a".into(),
+                host: "10.0.0.1".into(),
+                ..Default::default()
+            },
+            Host {
+                id: "b".into(),
+                host: "10.0.0.2".into(),
+                ..Default::default()
+            },
+        ];
+        let picked = targets_for(&hosts, &["b".to_string()]);
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].id, "b");
     }
 }
