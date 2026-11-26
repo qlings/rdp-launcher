@@ -26,9 +26,9 @@ rdp-launcher.exe      # 单文件，主机、密码、设置都在里面
 |---|---|---|
 | ![](docs/dialog-add.png) | ![](docs/settings-general.png) | ![](docs/dialog-import.png) |
 
-| 关于 |
-|---|
-| ![](docs/about.png) |
+| 导入配置 | 关于 |
+|---|---|
+| ![](docs/dialog-transfer.png) | ![](docs/about.png) |
 
 ## 功能
 
@@ -52,6 +52,9 @@ rdp-launcher.exe      # 单文件，主机、密码、设置都在里面
   复制品插在原主机下面，改完不用重新填一遍。
 - **导入本机历史**：设置最上面的「导入本机远程桌面历史…」，把 mstsc 连过的机器列成一张清单，
   能导入的默认全选、可多选，已经在列表里的标灰跳过；确认后才落库。列表为空时首页上也有这个入口。
+- **导出 / 导入配置**：设置 → 导入 / 导出。把全部配置（主机**含密码**、分组、设置项、最近连接）
+  写进一个加密的 `.rdplcfg` 文件，换台电脑选这个文件再导回来；导入前先列出内容让你勾
+  （主机逐台勾、分组 / 设置项 / 最近连接按类别勾），导入是合并，同地址同端口自动跳过。
 - **默认值**：新增 / 导入的主机默认带剪贴板、不带声音、映射本机全部盘符。
 - **关闭后保持后台**：默认关闭；开启后关窗口只隐藏主界面，任务栏通知区域留一个小图标。
 - **托盘右键菜单**：只列最近用过的 3 台（点一下直接连）/ 打开主界面（全部主机）/ 退出。
@@ -116,10 +119,12 @@ rdp-launcher.exe      # 单文件，主机、密码、设置都在里面
 | `Ctrl+N` | 新增主机 |
 | `Ctrl+F` | 聚焦搜索框（搜索栏打开时） |
 
-顶部：`● 在线 x/y`（点一下重新检测，悬停看上次检测时间）、`+ 新增主机`、`设置`、主题切换。
+顶部：`● 在线 x/y` 状态胶囊（比按钮小一圈，点一下重新检测，悬停看上次检测时间）、`+ 新增主机`、`设置`。
+**主题切换只在设置里**（顶部不再放月亮/太阳按钮），少一个抢眼的东西。
 分组胶囊加大到 40px 高，方便点。
-设置是单页：**常规**（Windows 兼容 / 排序 / 探测 + 自动刷新间隔 / 搜索栏 / 关闭后保持后台 /
-显示方式 / 主题 / 默认分组）在最上面，**分组编辑**（改名、上下移、删除、设默认）在最下面，滚动到底即可。
+设置是单页：**导入 / 导出**（导入本机历史、导出配置、导入配置）、**Windows 兼容**、排序、
+探测 + 自动刷新间隔、搜索栏、关闭后保持后台、显示方式、**主题**、默认分组在最上面，
+**分组编辑**（改名、上下移、删除、设默认）在最下面，滚动到底即可。
 
 ## 关闭后保持后台（托盘）
 
@@ -253,9 +258,11 @@ libgallium_wgl.dll      ← 来自 software-render\
 | `src/taskbar.rs` | 按 pid 找主窗口、关闭时收托盘（TOOLWINDOW + DeleteTab）、还原 |
 | `src/probe.rs` | 后台线程池 TCP 探活（同地址去重、按 id 扇出、多批并行、自动刷新控制器） |
 | `src/history.rs` | 读 HKCU 里 mstsc 的 MRU / Servers 历史，去重后给「导入主机」用（只读） |
+| `src/transfer.rs` | 配置导出 / 导入：`.rdplcfg` 打包、解密、合并（跳过同地址同端口、id 撞车换新）、时间戳 |
+| `src/filedlg.rs` | 原生保存 / 打开文件框（comdlg32 的 `GetSaveFileNameW` / `GetOpenFileNameW`） |
 | `src/update.rs` | 「关于」里的 GitHub 最新版检查（WinHTTP，releases/latest 跳转 + API 兜底） |
 | `src/ui.rs` | 配色、顶部栏、大分组胶囊、列表 / 方块卡片、空状态、Toast |
-| `src/dialogs.rs` | 新增/编辑主机弹窗（复制一份）、设置弹窗（导入主机 / 分组编辑在底部）、导入多选弹窗、关于弹窗 |
+| `src/dialogs.rs` | 新增/编辑主机弹窗（复制一份）、设置弹窗（导入 / 导出 / 分组编辑在底部）、导入多选弹窗、导入配置弹窗、关于弹窗 |
 | `src/main.rs` | 窗口、字体、主循环、快捷键、托盘、后台/退出、存储协调 |
 | `build.rs` | 用 `rc.exe` 嵌图标 / 版本信息 / DPI 清单 |
 
@@ -268,13 +275,15 @@ libgallium_wgl.dll      ← 来自 software-render\
 cargo test
 cargo test -- --ignored real_connect_flow --nocapture   # 真连一次，会写凭据、弹 mstsc
 cargo test fetches_latest_release_from_github -- --ignored   # 真问一次 GitHub
+cargo test writes_sample_export_file -- --ignored --nocapture   # 生成一份样例 .rdplcfg（手动试导入用）
 ```
 
-87 个单元测试（另有 2 个默认 ignore 的联网测试）覆盖：加密回环、数据流/尾部读写与 revision 选择、
+96 个单元测试（另有 3 个默认 ignore 的联网 / 手动测试）覆盖：加密回环、数据流/尾部读写与 revision 选择、
 坏数据备份与「改用旧备份」提示、旧 JSON 迁移、
 最近主机去重/上限/失效清理、地址解析（域名+端口 / IPv6 / IPv6 zone id / 非法端口 / 换行注入）、空密码凭据写入/读回、粘贴地址+端口自动拆分、
 密码提示状态、同 IP 不同端口、凭据大小写不敏感共用判断、多分组过滤、三种排序、复制主机（字段照搬 / 重名编号 / 插入位置）、
 历史导入（去重 / 默认值 / 跳过已存在 / 导入清单默认全选 / 已存在的勾不上）、
+配置导出/导入（密码回环 / 文件头识别 / 截断拒绝 / 合并时跳过重复 / id 撞车换新 / 空勾选不改动）、
 托盘快速连接（只列最近 3 台 / 无主机时的提示）、
 探活（同地址只连一次扇出给所有副本 / 多批并行 / 过期结果清理 / 只测指定主机）、
 导入弹窗在无窗口环境下的绘制（有主机 / 空历史两种）、版本比较与 GitHub 跳转解析、
@@ -288,7 +297,9 @@ cargo test fetches_latest_release_from_github -- --ignored   # 真问一次 GitH
 
 | 环境变量 | 效果 |
 |---|---|
-| `RDP_LAUNCHER_OPEN_DIALOG=add\|edit\|delete\|settings\|import\|about\|toast` | 启动时直接弹对应窗口（`import` 会同时打开设置和导入多选） |
+| `RDP_LAUNCHER_OPEN_DIALOG=add\|edit\|delete\|settings\|import\|transfer\|about\|toast` | 启动时直接弹对应窗口（`import` = 设置 + 导入多选；`transfer` = 设置 + 导入配置） |
+| `RDP_LAUNCHER_IMPORT_FROM=<路径>` | 跳过文件选择框，直接读这个 `.rdplcfg`（配合 `transfer` 截图 / 自测） |
+| `RDP_LAUNCHER_EXPORT_TO=<路径>` | 启动后立刻把配置导出到这个路径，跳过保存框 |
 | `RDP_LAUNCHER_THEME=dark` | 深色主题启动 |
 | `RDP_LAUNCHER_VIEW=grid\|list` | 指定显示方式启动 |
 | `RDP_LAUNCHER_CLOSE_TO_TRAY=1` | 强制开启「关闭后保持后台」，用于测试托盘 |
@@ -316,6 +327,8 @@ cargo test fetches_latest_release_from_github -- --ignored   # 真问一次 GitH
     真实鼠标双击/右键菜单还需要在正常桌面会话里点一次确认。
 11. 盘符存在性是后台预探；刚启动的一瞬间还没探完时，勾了但不存在的盘可能先写进 `.rdp`，
     mstsc 会自己忽略。
+12. **导出文件不设独立密码**：`.rdplcfg` 用和 exe 存储同一把密钥（固定口令派生），
+    所以任何一份本软件都能解开它。作用是「换机可读 + 不是明文」，不是「丢了也解不开」。
 
 ## 文档索引
 
@@ -327,8 +340,9 @@ cargo test fetches_latest_release_from_github -- --ignored   # 真问一次 GitH
 | [docs/main-dark.png](docs/main-dark.png) | 深色主界面 |
 | [docs/main-grid.png](docs/main-grid.png) | 方块视图 |
 | [docs/dialog-edit.png](docs/dialog-edit.png) | 编辑主机（多分组 / 盘符 / 声音 / 序号） |
-| [docs/settings-general.png](docs/settings-general.png) | 设置 · 单页（导入 / 自动刷新间隔 / 分组编辑在最下面） |
+| [docs/settings-general.png](docs/settings-general.png) | 设置 · 单页（导入 / 导出 / 自动刷新间隔 / 分组编辑在最下面） |
 | [docs/dialog-import.png](docs/dialog-import.png) | 导入本机远程桌面历史（多选，默认全选） |
+| [docs/dialog-transfer.png](docs/dialog-transfer.png) | 导入配置（`.rdplcfg`，分项勾选，带密码的主机有标注） |
 | [docs/about.png](docs/about.png) | 关于（GitHub / 最新版状态 / QLing 制作） |
 | [docs/warning-banner.png](docs/warning-banner.png) | 顶部「关闭 RDP 安全警告」提示 |
 | [docs/dialog-delete.png](docs/dialog-delete.png) | 编辑界面内的删除确认 |

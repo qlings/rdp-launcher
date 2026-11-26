@@ -8,6 +8,7 @@
 mod crypto;
 mod dialogs;
 mod drives;
+mod filedlg;
 mod history;
 mod models;
 mod probe;
@@ -15,6 +16,7 @@ mod rdp;
 mod rdp_warning;
 mod store;
 mod taskbar;
+mod transfer;
 mod ui;
 mod update;
 
@@ -36,11 +38,13 @@ use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
 
 use dialogs::{
     HostDialogOutcome, HostForm, ImportDraft, ImportOutcome, SettingsDraft, SettingsOutcome,
+    TransferDraft, TransferOutcome,
 };
 use drives::DriveInfo;
 use models::Host;
 use probe::ProbeStatus;
 use store::Store as StoreData;
+use transfer::{TransferDoc, TransferPick};
 use ui::{Palette, RowAction};
 
 // ---------------------------------------------------------------------------
@@ -272,6 +276,8 @@ struct LauncherApp {
     settings_draft: Option<SettingsDraft>,
     /// 「导入本机远程桌面历史」的多选弹窗
     import_draft: Option<ImportDraft>,
+    /// 「导入配置」（.rdplcfg 文件）的勾选弹窗
+    transfer_draft: Option<TransferDraft>,
     about_open: bool,
     toasts: Vec<ui::Toast>,
 
@@ -435,6 +441,7 @@ impl LauncherApp {
             form: None,
             settings_draft: None,
             import_draft: None,
+            transfer_draft: None,
             about_open: false,
             toasts: Vec::new(),
             dirty: false,
@@ -485,6 +492,20 @@ impl LauncherApp {
                 // 截图/自测用：设置弹窗 + 叠在上面的导入多选弹窗
                 app.settings_draft = Some(SettingsDraft::new(&app.store));
                 app.import_draft = Some(ImportDraft::from_local(&app.store));
+            }
+            // 截图/自测用：设置弹窗 + 「导入配置」勾选弹窗，文件从环境变量给
+            Ok("transfer") => {
+                app.settings_draft = Some(SettingsDraft::new(&app.store));
+                if let Some(path) = std::env::var_os("RDP_LAUNCHER_IMPORT_FROM") {
+                    let path = PathBuf::from(path);
+                    match transfer::TransferDoc::read(&path) {
+                        Ok(doc) => {
+                            let draft = TransferDraft::new(path, doc, &app.store.hosts);
+                            app.transfer_draft = Some(draft);
+                        }
+                        Err(e) => app.push_toast(format!("导入失败：{e}"), true),
+                    }
+                }
             }
             Ok("about") => app.about_open = true,
             Ok("toast") => {
@@ -1040,6 +1061,146 @@ impl LauncherApp {
     }
 
     // -----------------------------------------------------------------------
+    // 配置导出 / 导入（.rdplcfg 文件，跨电脑搬整份配置）
+    // -----------------------------------------------------------------------
+
+    /// 导出时先放桌面，没有桌面放「文档」，再不行放 exe 旁边。
+    fn export_dir(&self) -> PathBuf {
+        let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
+        if let Some(home) = &home {
+            for name in ["Desktop", "Documents"] {
+                let dir = home.join(name);
+                if dir.is_dir() {
+                    return dir;
+                }
+            }
+        }
+        self.exe_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default()
+    }
+
+    /// 把整份配置写成文件。`path = None` 时弹原生保存框（自测可用 `RDP_LAUNCHER_EXPORT_TO` 跳过）。
+    fn export_config(&mut self, path: Option<PathBuf>, ctx: &egui::Context) {
+        let path = path
+            .or_else(|| std::env::var_os("RDP_LAUNCHER_EXPORT_TO").map(PathBuf::from))
+            .or_else(|| {
+                let default = self.export_dir().join(transfer::default_file_name());
+                filedlg::save_file(
+                    taskbar::main_window(),
+                    "导出配置（含密码，注意保管）",
+                    transfer::FILE_EXT,
+                    &default.display().to_string(),
+                )
+            });
+        let Some(path) = path else {
+            self.push_toast("已取消导出", false);
+            ctx.request_repaint();
+            return;
+        };
+
+        let (display_time, _) = transfer::local_stamp();
+        let doc = TransferDoc::from_store(&self.store, env!("CARGO_PKG_VERSION"), &display_time);
+        match doc.write(&path) {
+            Ok(()) => {
+                trace(&format!(
+                    "transfer: exported {} hosts -> {}",
+                    doc.hosts.len(),
+                    path.display()
+                ));
+                self.push_toast(
+                    format!(
+                        "已导出 {} 台主机（含密码）、{} 个分组到 {}",
+                        doc.hosts.len(),
+                        doc.groups.len(),
+                        path.display()
+                    ),
+                    false,
+                );
+            }
+            Err(e) => self.push_toast(format!("导出失败：{e}"), true),
+        }
+        ctx.request_repaint();
+    }
+
+    /// 选一个文件读进来，然后叠一层「勾选要导入什么」的弹窗。
+    /// `path = None` 时弹原生打开框（自测可用 `RDP_LAUNCHER_IMPORT_FROM` 跳过）。
+    fn open_transfer_dialog(&mut self, path: Option<PathBuf>, ctx: &egui::Context) {
+        let path = path
+            .or_else(|| std::env::var_os("RDP_LAUNCHER_IMPORT_FROM").map(PathBuf::from))
+            .or_else(|| {
+                filedlg::open_file(taskbar::main_window(), "选择配置备份", transfer::FILE_EXT)
+            });
+        let Some(path) = path else {
+            self.push_toast("已取消导入", false);
+            ctx.request_repaint();
+            return;
+        };
+        match TransferDoc::read(&path) {
+            Ok(doc) => {
+                trace(&format!(
+                    "transfer: opened {} ({} hosts)",
+                    path.display(),
+                    doc.hosts.len()
+                ));
+                self.transfer_draft = Some(TransferDraft::new(path, doc, &self.store.hosts));
+            }
+            Err(e) => self.push_toast(format!("导入失败：{e}"), true),
+        }
+        ctx.request_repaint();
+    }
+
+    /// 把用户勾中的内容合并进来。设置项可能整块换掉，探活 / 托盘这些运行时状态要跟着调。
+    fn apply_transfer(&mut self, doc: &TransferDoc, pick: &TransferPick, ctx: &egui::Context) {
+        let probe_was_on = self.store.settings.probe;
+        let report = transfer::merge(&mut self.store, doc, pick);
+
+        if !self.store.settings.probe {
+            self.probe.clear();
+        } else if !probe_was_on {
+            self.probe.clear();
+            self.start_probe(ctx, false);
+        }
+        if !self.store.settings.close_to_tray {
+            self.tray = None;
+            self.hidden_to_tray = false;
+        }
+        if !self.store.settings.show_search {
+            self.search.clear();
+        }
+        // 导入设置里的默认分组可能在本机不存在（normalize 已经清掉了），过滤也跟着回到「全部」
+        if let Some(current) = self.group_filter.clone() {
+            if !self.store.groups.iter().any(|g| g.name == current) {
+                self.group_filter = None;
+            }
+        }
+
+        self.persist();
+        self.refresh_tray_menu();
+        self.refresh_visible();
+        if !report.added_ids.is_empty() {
+            self.probe_hosts(&report.added_ids, ctx);
+        }
+        // 设置弹窗还开着的话，它手里的草稿是导入前的旧值：重新从 store 拉一份，
+        // 否则用户接着点「保存」会把刚导进来的设置又盖回去。
+        if self.settings_draft.is_some() {
+            self.settings_draft = Some(SettingsDraft::new(&self.store));
+        }
+
+        let nothing = report.hosts_added == 0
+            && report.groups_added == 0
+            && !report.settings_applied
+            && report.recent_added == 0;
+        let mut message = report.summary();
+        if report.hosts_skipped > 0 {
+            message.push_str(&format!("（跳过 {} 台已在列表里的）", report.hosts_skipped));
+        }
+        self.push_toast(message, nothing);
+        ctx.request_repaint();
+    }
+
+    // -----------------------------------------------------------------------
     // 「关于」里的最新版检查
     // -----------------------------------------------------------------------
 
@@ -1188,6 +1349,12 @@ impl LauncherApp {
         use egui::{Key, Modifiers};
 
         // 弹窗打开时：Esc 关最上面那层，其它键留给弹窗里的输入框
+        if self.transfer_draft.is_some() {
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+                self.transfer_draft = None;
+            }
+            return;
+        }
         if self.import_draft.is_some() {
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
                 self.import_draft = None;
@@ -1294,6 +1461,10 @@ impl eframe::App for LauncherApp {
         self.frame_count = self.frame_count.saturating_add(1);
         if self.frame_count == 2 {
             self.refresh_drive_presence(ctx);
+            // 自测：RDP_LAUNCHER_EXPORT_TO=<路径> 时启动即导出，不用点设置里的按钮
+            if std::env::var_os("RDP_LAUNCHER_EXPORT_TO").is_some() {
+                self.export_config(None, ctx);
+            }
         }
 
         if self.visible_dirty {
@@ -1481,7 +1652,6 @@ impl eframe::App for LauncherApp {
                     &mut self.search,
                     self.store.settings.show_search,
                     &mut self.want_focus_search,
-                    self.store.settings.dark,
                     probe_summary,
                 );
                 if top.open_add {
@@ -1494,10 +1664,6 @@ impl eframe::App for LauncherApp {
                 }
                 if top.open_settings {
                     self.settings_draft = Some(SettingsDraft::new(&self.store));
-                }
-                if top.toggle_theme {
-                    self.store.settings.dark = !self.store.settings.dark;
-                    self.persist();
                 }
                 if top.refresh_probe {
                     if self.store.settings.probe {
@@ -1679,7 +1845,8 @@ impl eframe::App for LauncherApp {
         }
 
         // 导入弹窗打开时把设置弹窗让出来：两层模态叠着太吵，关掉导入就回到设置
-        if self.settings_draft.is_some() && self.import_draft.is_none() {
+        if self.settings_draft.is_some() && self.import_draft.is_none() && self.transfer_draft.is_none()
+        {
             let mut draft = self.settings_draft.take().expect("checked is_some");
             match dialogs::draw_settings_dialog(ctx, &pal, &mut draft) {
                 SettingsOutcome::None => self.settings_draft = Some(draft),
@@ -1696,6 +1863,14 @@ impl eframe::App for LauncherApp {
                     self.settings_draft = Some(draft);
                     self.open_import_dialog(ctx);
                 }
+                SettingsOutcome::ExportConfig => {
+                    self.settings_draft = Some(draft);
+                    self.export_config(None, ctx);
+                }
+                SettingsOutcome::ImportConfig => {
+                    self.settings_draft = Some(draft);
+                    self.open_transfer_dialog(None, ctx);
+                }
             }
         }
 
@@ -1707,6 +1882,18 @@ impl eframe::App for LauncherApp {
                 ImportOutcome::Cancel => {}
                 ImportOutcome::Import(entries) => {
                     self.apply_import(entries, ctx);
+                }
+            }
+        }
+
+        // 导入配置弹窗：同样叠在设置之上
+        if self.transfer_draft.is_some() {
+            let mut draft = self.transfer_draft.take().expect("checked is_some");
+            match dialogs::draw_transfer_dialog(ctx, &pal, &mut draft) {
+                TransferOutcome::None => self.transfer_draft = Some(draft),
+                TransferOutcome::Cancel => {}
+                TransferOutcome::Apply(pick) => {
+                    self.apply_transfer(&draft.doc, &pick, ctx);
                 }
             }
         }

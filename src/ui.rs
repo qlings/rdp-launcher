@@ -92,7 +92,6 @@ pub fn palette(dark: bool) -> Palette {
 pub struct TopBarOutput {
     pub open_add: bool,
     pub open_settings: bool,
-    pub toggle_theme: bool,
     /// 这一帧搜索词变了：列表要重算过滤 + 排序
     pub search_changed: bool,
     /// 点了「在线 x/y」小胶囊：立刻重新检测一轮
@@ -117,21 +116,20 @@ pub fn draw_top_bar(
     search: &mut String,
     show_search: bool,
     want_focus_search: &mut bool,
-    dark: bool,
     probe: ProbeSummary,
 ) -> TopBarOutput {
     let mut out = TopBarOutput {
         open_add: false,
         open_settings: false,
-        toggle_theme: false,
         search_changed: false,
         refresh_probe: false,
     };
 
     ui.horizontal(|ui| {
         if show_search {
-            // 按钮区大概占 250px，剩下的都给搜索框；窄窗口下保底 120px
-            let width = (ui.available_width() - 258.0).max(120.0);
+            // 按钮区大概占 214px（设置 64 + 新增 104 + 在线胶囊 + 间距），
+            // 剩下的都给搜索框；窄窗口下保底 120px
+            let width = (ui.available_width() - 214.0).max(120.0);
             let text_edit = egui::TextEdit::singleline(search)
                 .hint_text("搜索备注名 / 地址 / 端口 / 分组…")
                 .desired_width(width)
@@ -150,15 +148,6 @@ pub fn draw_top_bar(
         }
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let theme_label = if dark { "☀" } else { "🌙" };
-            let theme_btn = egui::Button::new(RichText::new(theme_label).size(16.0))
-                .fill(pal.accent_soft)
-                .corner_radius(CornerRadius::same(9))
-                .min_size(Vec2::new(38.0, 38.0));
-            if ui.add(theme_btn).on_hover_text("切换主题").clicked() {
-                out.toggle_theme = true;
-            }
-
             let settings_btn = egui::Button::new(
                 RichText::new("设置")
                     .size(14.0)
@@ -186,6 +175,7 @@ pub fn draw_top_bar(
             }
 
             // 在线统计 + 手动刷新二合一：点一下就重新检测，比在设置里找开关快。
+            // 刻意比「设置 / 新增」小一圈：它是状态汇总，不是主操作。
             let (label, color) = if !probe.enabled {
                 ("探活已关".to_string(), pal.text_dim)
             } else if probe.checking {
@@ -200,13 +190,17 @@ pub fn draw_top_bar(
                 };
                 (format!("● {}/{}", probe.online, probe.total), color)
             };
-            let probe_btn = egui::Button::new(RichText::new(label).size(12.5).color(color))
+            let probe_btn = egui::Button::new(RichText::new(label).size(11.5).color(color))
                 .fill(pal.panel)
                 .stroke(Stroke::new(1.0_f32, pal.border))
-                .corner_radius(CornerRadius::same(9))
-                .min_size(Vec2::new(0.0, 38.0));
-            if ui
-                .add(probe_btn)
+                .corner_radius(CornerRadius::same(8))
+                .min_size(Vec2::new(0.0, 24.0));
+            // 只在这一颗按钮上收窄内边距，别的按钮还是默认手感
+            let saved_padding = ui.spacing().button_padding;
+            ui.spacing_mut().button_padding = Vec2::new(9.0, 2.0);
+            let probe_resp = ui.add(probe_btn);
+            ui.spacing_mut().button_padding = saved_padding;
+            if probe_resp
                 .on_hover_text(if probe.enabled {
                     let when = match probe.since_last {
                         Some(elapsed) if elapsed.as_secs() < 5 => "刚刚检测".to_string(),

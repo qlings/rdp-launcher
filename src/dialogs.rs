@@ -15,6 +15,7 @@ use crate::history::HistoryEntry;
 use crate::models::{self, Group, Host, Settings, SortMode, ViewMode};
 use crate::rdp_warning;
 use crate::store::Store;
+use crate::transfer::{TransferDoc, TransferPick};
 use crate::ui::{chip, chip_disabled, segmented, Palette};
 
 // ---------------------------------------------------------------------------
@@ -789,6 +790,10 @@ pub enum SettingsOutcome {
     /// 点了「导入本机远程桌面历史」：由调用方真正去读注册表并落库，
     /// 设置弹窗保持打开。
     ImportHistory,
+    /// 点了「导出配置…」：调用方弹文件保存框并写文件，设置弹窗保持打开。
+    ExportConfig,
+    /// 点了「导入配置…」：调用方弹文件选择框、读文件，再叠一层勾选弹窗。
+    ImportConfig,
 }
 
 pub fn draw_settings_dialog(
@@ -831,35 +836,71 @@ pub fn draw_settings_dialog(
                 )
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    section_title(ui, pal, "导入主机");
+                    section_title(ui, pal, "导入 / 导出");
                     ui.label(
                         RichText::new(
-                            "把本机 Windows 远程桌面（mstsc）连过的机器导入成主机：\
-                             点下面的按钮会先列出所有找到的主机，勾选要哪些再确认。",
+                            "从本机远程桌面（mstsc）导入主机，或把整份配置导出成文件，带到另一台电脑再导回来。",
                         )
                         .size(11.0)
                         .color(pal.text_dim),
                     );
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new("导入本机远程桌面历史…")
-                                    .size(12.0)
-                                    .color(Color32::WHITE),
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = Vec2::new(8.0, 6.0);
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("导入本机远程桌面历史…")
+                                        .size(12.0)
+                                        .color(Color32::WHITE),
+                                )
+                                .fill(pal.accent)
+                                .corner_radius(CornerRadius::same(7))
+                                .min_size(Vec2::new(0.0, 31.0)),
                             )
-                            .fill(pal.accent)
-                            .corner_radius(CornerRadius::same(7))
-                            .min_size(Vec2::new(0.0, 31.0)),
-                        )
-                        .on_hover_text("读 HKCU 下 mstsc 的最近连接记录，列出机器供勾选，不改动 Windows 自身设置")
-                        .clicked()
-                    {
-                        outcome = SettingsOutcome::ImportHistory;
-                    }
+                            .on_hover_text("读 HKCU 下 mstsc 的最近连接记录，列出机器供勾选，不改动 Windows 自身设置")
+                            .clicked()
+                        {
+                            outcome = SettingsOutcome::ImportHistory;
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("导出配置…")
+                                        .size(12.0)
+                                        .color(pal.accent),
+                                )
+                                .fill(pal.accent_soft)
+                                .corner_radius(CornerRadius::same(7))
+                                .min_size(Vec2::new(0.0, 31.0)),
+                            )
+                            .on_hover_text("主机（含密码）、分组、设置项全部写进一个加密的 .rdplcfg 文件")
+                            .clicked()
+                        {
+                            outcome = SettingsOutcome::ExportConfig;
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("导入配置…")
+                                        .size(12.0)
+                                        .color(pal.accent),
+                                )
+                                .fill(pal.accent_soft)
+                                .corner_radius(CornerRadius::same(7))
+                                .min_size(Vec2::new(0.0, 31.0)),
+                            )
+                            .on_hover_text("选一个 .rdplcfg 文件，先列出里面的内容，勾选要导入的部分")
+                            .clicked()
+                        {
+                            outcome = SettingsOutcome::ImportConfig;
+                        }
+                    });
                     ui.label(
                         RichText::new(
-                            "能导入的默认全选；已经在列表里的会标灰跳过。\
-                             导入的主机默认带剪贴板、不带声音、映射本机全部盘符，进来后可以逐台改。",
+                            "历史导入：能导入的默认全选，已在列表里的标灰跳过，密码要自己填。\n\
+                             导出配置：含全部主机和密码（文件已加密，但本软件都能解开，别随手传）。\n\
+                             导入配置：同地址同端口的主机自动跳过，设置项勾了才会覆盖当前设置。",
                         )
                         .size(11.0)
                         .color(pal.text_dim),
@@ -1011,16 +1052,19 @@ pub fn draw_settings_dialog(
                             .size(11.0)
                             .color(pal.text_dim),
                     );
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("主题").size(12.0).color(pal.text_dim));
-                        segmented(
-                            ui,
-                            pal,
-                            &mut draft.settings.dark,
-                            &[(false, "浅色"), (true, "深色")],
-                        );
-                    });
+                    ui.add_space(12.0);
+                    section_title(ui, pal, "主题");
+                    segmented(
+                        ui,
+                        pal,
+                        &mut draft.settings.dark,
+                        &[(false, "浅色"), (true, "深色")],
+                    );
+                    ui.label(
+                        RichText::new("切主题只在设置里；点「保存」后整个界面立刻换。")
+                            .size(11.0)
+                            .color(pal.text_dim),
+                    );
 
                     ui.add_space(12.0);
                     section_title(ui, pal, "默认分组（启动时先展示）");
@@ -1596,6 +1640,343 @@ pub fn draw_import_dialog(
 }
 
 // ---------------------------------------------------------------------------
+// 导入配置（从 .rdplcfg 文件，跨电脑搬配置）
+// ---------------------------------------------------------------------------
+
+/// 弹窗里的一台待导入主机。
+pub struct TransferHostItem {
+    /// 在 `doc.hosts` 里的下标
+    pub index: usize,
+    pub name: String,
+    pub address: String,
+    pub has_password: bool,
+    /// 同地址同端口已经在列表里：标灰、不能勾
+    pub existing: bool,
+    pub selected: bool,
+}
+
+/// 「导入配置」弹窗的草稿：先把文件里的内容全列出来，让人挑要哪些。
+pub struct TransferDraft {
+    pub path: std::path::PathBuf,
+    pub doc: TransferDoc,
+    pub hosts: Vec<TransferHostItem>,
+    pub take_groups: bool,
+    pub take_settings: bool,
+    pub take_recent: bool,
+}
+
+impl TransferDraft {
+    /// `existing` 是导入前的主机列表，用来把「已经在列表里」的标灰。
+    pub fn new(path: std::path::PathBuf, doc: TransferDoc, existing: &[Host]) -> Self {
+        let hosts = doc
+            .hosts
+            .iter()
+            .enumerate()
+            .map(|(index, host)| {
+                let exists = models::address_exists(existing, &host.host, host.port);
+                TransferHostItem {
+                    index,
+                    name: if host.name.trim().is_empty() {
+                        host.display_address()
+                    } else {
+                        host.name.clone()
+                    },
+                    address: host.display_address(),
+                    has_password: !host.password.trim().is_empty(),
+                    existing: exists,
+                    selected: !exists,
+                }
+            })
+            .collect();
+        Self {
+            path,
+            doc,
+            hosts,
+            take_groups: true,
+            // 设置项会盖掉当前的排序 / 显示 / 主题 / 探活，默认不勾，想要自己点
+            take_settings: false,
+            take_recent: true,
+        }
+    }
+
+    pub fn importable(&self) -> usize {
+        self.hosts.iter().filter(|item| !item.existing).count()
+    }
+
+    pub fn selected_count(&self) -> usize {
+        self.hosts
+            .iter()
+            .filter(|item| item.selected && !item.existing)
+            .count()
+    }
+
+    pub fn all_selected(&self) -> bool {
+        self.importable() > 0 && self.selected_count() == self.importable()
+    }
+
+    pub fn set_all(&mut self, on: bool) {
+        for item in &mut self.hosts {
+            if !item.existing {
+                item.selected = on;
+            }
+        }
+    }
+
+    /// 文件里带密码的台数，弹窗提示用（不按勾选算：标灰的那些也算「文件里有」）。
+    pub fn with_password(&self) -> usize {
+        self.hosts.iter().filter(|item| item.has_password).count()
+    }
+
+    pub fn file_name(&self) -> String {
+        self.path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| self.path.display().to_string())
+    }
+
+    pub fn pick(&self) -> TransferPick {
+        TransferPick {
+            hosts: self
+                .hosts
+                .iter()
+                .filter(|item| item.selected && !item.existing)
+                .map(|item| item.index)
+                .collect(),
+            groups: self.take_groups && !self.doc.groups.is_empty(),
+            settings: self.take_settings,
+            recent: self.take_recent && !self.doc.recent.is_empty(),
+        }
+    }
+}
+
+pub enum TransferOutcome {
+    None,
+    Cancel,
+    /// 确认导入：只带勾中的内容。
+    Apply(TransferPick),
+}
+
+/// 导入配置弹窗：文件里有什么先摆明白，主机逐台勾，分组 / 设置项 / 最近连接按类勾。
+pub fn draw_transfer_dialog(
+    ctx: &egui::Context,
+    pal: &Palette,
+    draft: &mut TransferDraft,
+) -> TransferOutcome {
+    let mut outcome = TransferOutcome::None;
+
+    egui::Modal::new(egui::Id::new("transfer_dialog"))
+        .frame(
+            Frame::new()
+                .fill(pal.panel)
+                .stroke(Stroke::new(1.0_f32, pal.border))
+                .corner_radius(CornerRadius::same(14))
+                .inner_margin(Margin::same(20)),
+        )
+        .backdrop_color(Color32::from_black_alpha(110))
+        .show(ctx, |ui| {
+            let width = (ctx.screen_rect().width() - 56.0).clamp(340.0, 560.0);
+            ui.set_width(width);
+            ui.label(RichText::new("导入配置").size(18.0).strong().color(pal.text));
+
+            let meta = if draft.doc.app_version.trim().is_empty() {
+                String::new()
+            } else {
+                format!("导出自 v{}", draft.doc.app_version.trim())
+            };
+            let mut subtitle = draft.file_name();
+            if !draft.doc.exported_at.trim().is_empty() {
+                subtitle.push_str(&format!("  ·  {}", draft.doc.exported_at.trim()));
+            }
+            if !meta.is_empty() {
+                subtitle.push_str(&format!("  ·  {meta}"));
+            }
+            ui.label(RichText::new(subtitle).size(11.5).color(pal.text_dim));
+            ui.label(
+                RichText::new(draft.doc.summary())
+                    .size(11.0)
+                    .color(pal.hint),
+            );
+            ui.add_space(6.0);
+
+            ui.label(
+                RichText::new("勾选要导入的内容：")
+                    .size(12.0)
+                    .color(pal.text_dim),
+            );
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                if !draft.doc.groups.is_empty() {
+                    let label = format!("分组 {} 个", draft.doc.groups.len());
+                    if chip(ui, pal, draft.take_groups, &label, 0.0)
+                        .on_hover_text("缺的分组补进来，同名的不会重复")
+                        .clicked()
+                    {
+                        draft.take_groups = !draft.take_groups;
+                    }
+                }
+                let settings_label = "设置项（覆盖当前）".to_string();
+                if chip(ui, pal, draft.take_settings, &settings_label, 0.0)
+                    .on_hover_text("排序、显示方式、主题、探活间隔、托盘这些会被文件里的设置盖掉")
+                    .clicked()
+                {
+                    draft.take_settings = !draft.take_settings;
+                }
+                if !draft.doc.recent.is_empty() {
+                    let label = format!("最近连接 {} 条", draft.doc.recent.len());
+                    if chip(ui, pal, draft.take_recent, &label, 0.0)
+                        .on_hover_text("导进来的主机照样按原来的最近顺序排在托盘里")
+                        .clicked()
+                    {
+                        draft.take_recent = !draft.take_recent;
+                    }
+                }
+            });
+
+            ui.add_space(6.0);
+            if draft.hosts.is_empty() {
+                ui.label(
+                    RichText::new("这个文件里没有主机，只能导入分组 / 设置项。")
+                        .size(12.0)
+                        .color(pal.text_dim),
+                );
+            } else {
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("全选").size(11.5).color(pal.accent),
+                            )
+                            .fill(Color32::TRANSPARENT)
+                            .stroke(Stroke::NONE)
+                            .min_size(Vec2::new(0.0, 24.0)),
+                        )
+                        .clicked()
+                    {
+                        draft.set_all(true);
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("全不选").size(11.5).color(pal.text_dim),
+                            )
+                            .fill(Color32::TRANSPARENT)
+                            .stroke(Stroke::NONE)
+                            .min_size(Vec2::new(0.0, 24.0)),
+                        )
+                        .clicked()
+                    {
+                        draft.set_all(false);
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let suffix = if draft.all_selected() { "（全部）" } else { "" };
+                        let text = if draft.importable() == 0 {
+                            "都在列表里了".to_string()
+                        } else {
+                            format!(
+                                "已选 {}/{}{suffix}",
+                                draft.selected_count(),
+                                draft.importable()
+                            )
+                        };
+                        ui.label(RichText::new(text).size(11.0).color(pal.text_dim));
+                    });
+                });
+
+                ui.add_space(2.0);
+                let body_h = (ctx.screen_rect().height() - 330.0).max(110.0);
+                egui::ScrollArea::vertical()
+                    .max_height(body_h)
+                    .scroll_bar_visibility(
+                        egui::containers::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
+                    )
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        for item in &mut draft.hosts {
+                            ui.horizontal(|ui| {
+                                if item.existing {
+                                    chip_disabled(ui, pal, &item.name);
+                                    ui.label(
+                                        RichText::new(format!("{}  · 已在列表", item.address))
+                                            .size(11.0)
+                                            .color(pal.text_dim),
+                                    );
+                                } else {
+                                    if chip(ui, pal, item.selected, &item.name, 0.0).clicked() {
+                                        item.selected = !item.selected;
+                                    }
+                                    let mut detail = item.address.clone();
+                                    if item.has_password {
+                                        detail.push_str("  · 带密码");
+                                    }
+                                    ui.label(
+                                        RichText::new(detail).size(11.0).color(pal.text_dim),
+                                    );
+                                }
+                            });
+                        }
+                    });
+            }
+
+            ui.add_space(10.0);
+            let with_password = draft.with_password();
+            let hint = if with_password > 0 {
+                format!(
+                    "文件里有 {with_password} 台带密码，导入后可以直接连；同地址同端口的主机不会重复导入。"
+                )
+            } else {
+                "同地址同端口的主机不会重复导入；这个文件里的主机没有存密码。".to_string()
+            };
+            ui.label(RichText::new(hint).size(11.0).color(pal.text_dim));
+
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let pick = draft.pick();
+                    let can_apply = !pick.is_empty();
+                    let label = if draft.selected_count() > 0 {
+                        format!("导入 {} 台", draft.selected_count())
+                    } else {
+                        "导入".to_string()
+                    };
+                    let apply_btn = egui::Button::new(
+                        RichText::new(label).size(13.0).color(Color32::WHITE),
+                    )
+                    .fill(if can_apply { pal.accent } else { pal.checking })
+                    .corner_radius(CornerRadius::same(9))
+                    .min_size(Vec2::new(96.0, 34.0));
+                    if ui
+                        .add_enabled(can_apply, apply_btn)
+                        .on_hover_text(if can_apply {
+                            "把勾中的内容合并进当前配置"
+                        } else {
+                            "先勾选至少一项"
+                        })
+                        .clicked()
+                    {
+                        outcome = TransferOutcome::Apply(pick);
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("取消").size(13.0).color(pal.text_dim),
+                            )
+                            .fill(pal.panel)
+                            .stroke(Stroke::new(1.0_f32, pal.border))
+                            .corner_radius(CornerRadius::same(9))
+                            .min_size(Vec2::new(76.0, 34.0)),
+                        )
+                        .clicked()
+                    {
+                        outcome = TransferOutcome::Cancel;
+                    }
+                });
+            });
+        });
+
+    outcome
+}
+
+// ---------------------------------------------------------------------------
 // 关于
 // ---------------------------------------------------------------------------
 
@@ -1678,12 +2059,9 @@ pub fn draw_about_dialog(
             );
             ui.add_space(4.0);
             for line in [
-                "单文件绿色版：主机、密码、分组、设置都加密存在 exe 里，不生成 json。",
-                "支持多分组、端口单独配置、磁盘 / 声音 / 剪贴板映射、序号排序。",
-                "本机远程桌面历史一键导入：先列出找到的主机，勾选要哪些再导入。",
-                "在线状态启动时测一次，之后按设置的间隔自动刷新，也能点顶部胶囊 / F5 立刻重测。",
-                "列表 / 方块显示、关闭后保持后台、托盘右键只列最近三台常用主机。",
-                "内置 Windows 2026 RDP 安全警告的关闭开关。",
+                "单文件绿色版：主机、密码、设置加密存在 exe 里，不生成 json。",
+                "多分组、端口独立、盘符 / 声音 / 剪贴板映射、在线状态自动刷新。",
+                "本机历史导入，配置可导出成文件带到另一台电脑。",
             ] {
                 ui.label(RichText::new(line).size(11.5).color(pal.text_dim));
             }

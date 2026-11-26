@@ -79,6 +79,12 @@ thread_local! {
     static TASKBAR: RefCell<Option<ITaskbarList>> = const { RefCell::new(None) };
 }
 
+/// 本进程主窗口句柄：给原生文件选择框当 owner 用，别让它跑到主窗口后面去。
+/// 找不到也没关系，对话框退化成无主窗口。
+pub fn main_window() -> Option<HWND> {
+    find_own_window()
+}
+
 fn taskbar() -> Option<ITaskbarList> {
     COM_READY.with(|ready| {
         if !ready.get() {
